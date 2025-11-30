@@ -1,5 +1,4 @@
 // go
 
 > cd source-code
-> go get hroot
 > go build
