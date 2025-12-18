@@ -1,1 +1,12 @@
+name: hammer-updater
+version: 0.2.0
 
+authors:
+  - HackerOS Team
+
+crystal: 1.0.0
+
+license: APACHE-2.0
+
+dependencies:
+  # No external dependencies needed for this simple CLI
