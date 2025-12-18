@@ -2,11 +2,11 @@ name: hammer
 version: 0.2
 
 authors:
-  - HackerOS Team <hackeros068@gmail.com>
+  - HackerOS Team
 
-description: |
-  HROOT - HackerOS Root: A tool for managing Btrfs snapshots and atomic updates.
-
-crystal: ">= 1.0.0"
+crystal: 1.0.0
 
 license: APACHE-2.0
+
+dependencies:
+  # No external dependencies needed for this simple CLI
