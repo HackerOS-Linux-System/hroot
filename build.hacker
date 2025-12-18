@@ -1,4 +1,6 @@
 // crystal
+// g++
 
 > cd source-code
-> crystal build src/main.cr --release
+>>> cd cli && crystal build src/main.cr --release
+>>> cd core && 
