@@ -1,6 +1,9 @@
 // crystal
-// g++
+// cargo
+// golang
 
 > cd source-code
 >>> cd cli && crystal build src/main.cr --release
->>> cd core && 
+>>> cd core && cargo build --release
+>>> cd builder && crystal build src/main.cr --release
+>>> cd updater && go get updater && go build
