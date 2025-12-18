@@ -1,3 +1,4 @@
+# ![Hammer - CLI Tool for Atomic HackerOS.](https://github.com/HackerOS-Linux-System/hammer/blob/main/images/hammer-nobackground.png)
 # hammer
 Atomic system for HackerOS
 
