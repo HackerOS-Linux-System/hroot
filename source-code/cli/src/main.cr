@@ -1,78 +1,151 @@
 require "option_parser"
 
 module Hammer
-  VERSION = "0.2"
+  VERSION = "0.3" # Updated version for expansions
   HAMMER_PATH = "#{ENV["HOME"]? || "/home/user"}/.hackeros/hammer"
 
   def self.main
-    command = ARGV.shift? || ""
-    args = ARGV.dup
-
+    return usage if ARGV.empty?
+    command = ARGV.shift
     case command
     when "install"
-      if args.size != 1
-        puts "Usage: hammer install <package>"
-        exit(1)
-      end
-      run_core("install", args)
+      install_command(ARGV)
     when "remove"
-      if args.size != 1
-        puts "Usage: hammer remove <package>"
-        exit(1)
-      end
-      run_core("remove", args)
+      remove_command(ARGV)
     when "update"
-      if args.size != 0
-        puts "Usage: hammer update"
-        exit(1)
-      end
-      run_updater("update", args)
+      update_command(ARGV)
     when "clean"
-      if args.size != 0
-        puts "Usage: hammer clean"
-        exit(1)
-      end
-      run_core("clean", args)
+      clean_command(ARGV)
     when "refresh"
-      if args.size != 0
-        puts "Usage: hammer refresh"
-        exit(1)
-      end
-      run_core("refresh", args)
+      refresh_command(ARGV)
     when "build"
-      if args.size != 0
-        puts "Usage: hammer build"
-        exit(1)
-      end
-      run_builder("build", args)
-    when "back"
-      if args.size != 0
-        puts "Usage: hammer back"
-        exit(1)
-      end
-      run_core("back", args)
-    when "snapshot"
-      if args.size != 0
-        puts "Usage: hammer snapshot"
-        exit(1)
-      end
-      run_core("snapshot", args)
+      build_command(ARGV)
+    when "switch"
+      switch_command(ARGV)
+    when "deploy"
+      deploy_command(ARGV)
     when "build-init", "build init"
-      if args.size != 0
-        puts "Usage: hammer build init"
-        exit(1)
-      end
-      run_builder("init", args)
+      build_init_command(ARGV)
     when "about"
-      if args.size != 0
-        puts "Usage: hammer about"
-        exit(1)
-      end
-      about
+      about_command(ARGV)
     else
       usage
       exit(1)
     end
+  end
+
+  private def self.install_command(args : Array(String))
+    parser = OptionParser.new do |parser|
+      parser.banner = "Usage: hammer install [options] <package>"
+      parser.on("--atomic", "Install atomically in the system") { }
+      parser.unknown_args do |unknown_args|
+        if unknown_args.size != 1
+          puts parser
+          exit(1)
+        end
+      end
+    end
+    parser.parse(args.dup)
+    package = args[-1]? || ""
+    atomic_flag = args.includes?("--atomic") ? ["--atomic"] : [] of String
+    if package.empty?
+      puts parser
+      exit(1)
+    end
+    run_core("install", atomic_flag + [package])
+  end
+
+  private def self.remove_command(args : Array(String))
+    parser = OptionParser.new do |parser|
+      parser.banner = "Usage: hammer remove [options] <package>"
+      parser.on("--atomic", "Remove atomically from the system") { }
+      parser.unknown_args do |unknown_args|
+        if unknown_args.size != 1
+          puts parser
+          exit(1)
+        end
+      end
+    end
+    parser.parse(args.dup)
+    package = args[-1]? || ""
+    atomic_flag = args.includes?("--atomic") ? ["--atomic"] : [] of String
+    if package.empty?
+      puts parser
+      exit(1)
+    end
+    run_core("remove", atomic_flag + [package])
+  end
+
+  private def self.update_command(args : Array(String))
+    if args.size != 0
+      puts "Usage: hammer update"
+      exit(1)
+    end
+    run_updater("update", args)
+  end
+
+  private def self.clean_command(args : Array(String))
+    if args.size != 0
+      puts "Usage: hammer clean"
+      exit(1)
+    end
+    run_core("clean", args)
+  end
+
+  private def self.refresh_command(args : Array(String))
+    if args.size != 0
+      puts "Usage: hammer refresh"
+      exit(1)
+    end
+    run_core("refresh", args)
+  end
+
+  private def self.build_command(args : Array(String))
+    if args.size != 0
+      puts "Usage: hammer build"
+      exit(1)
+    end
+    run_builder("build", args)
+  end
+
+  private def self.switch_command(args : Array(String))
+    parser = OptionParser.new do |parser|
+      parser.banner = "Usage: hammer switch [deployment]"
+      parser.unknown_args do |unknown_args|
+        if unknown_args.size > 1
+          puts parser
+          exit(1)
+        end
+      end
+    end
+    parser.parse(args.dup)
+    deployment = args[0]? || ""
+    run_args = deployment.empty? ? [] of String : [deployment]
+    run_core("switch", run_args)
+  end
+
+  private def self.deploy_command(args : Array(String))
+    if args.size != 0
+      puts "Usage: hammer deploy"
+      exit(1)
+    end
+    run_core("deploy", args)
+  end
+
+  private def self.build_init_command(args : Array(String))
+    if args.size != 0
+      puts "Usage: hammer build init"
+      exit(1)
+    end
+    run_builder("init", args)
+  end
+
+  private def self.about_command(args : Array(String))
+    if args.size != 0
+      puts "Usage: hammer about"
+      exit(1)
+    end
+    about
   end
 
   private def self.run_core(subcommand : String, args : Array(String))
@@ -105,16 +178,16 @@ module Hammer
     puts "Usage: hammer <command> [options]"
     puts ""
     puts "Commands:"
-    puts "  install <package>    Install a package in container"
-    puts "  remove <package>     Remove a package from container"
-    puts "  update               Update the system (using snapshot)"
-    puts "  clean                Clean up unused resources"
-    puts "  refresh              Refresh repositories"
-    puts "  build                Build atomic ISO (must be in project dir)"
-    puts "  back                 Rollback to previous system version"
-    puts "  snapshot             Force create a snapshot"
-    puts "  build init           Initialize build project"
-    puts "  about                Show tool information"
+    puts " install [--atomic] <package> Install a package (optionally atomically)"
+    puts " remove [--atomic] <package> Remove a package (optionally atomically)"
+    puts " update Update the system atomically"
+    puts " clean Clean up unused resources"
+    puts " refresh Refresh repositories"
+    puts " build Build atomic ISO (must be in project dir)"
+    puts " switch [deployment] Switch to a deployment (rollback if no arg)"
+    puts " deploy Create a new deployment"
+    puts " build init Initialize build project"
+    puts " about Show tool information"
   end
 end
 
