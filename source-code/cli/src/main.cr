@@ -1,8 +1,16 @@
 require "option_parser"
 
 module Hammer
-  VERSION = "0.3" # Updated version for expansions
+  VERSION = "0.4" # Updated version for expansions
   HAMMER_PATH = "#{ENV["HOME"]? || "/home/user"}/.hackeros/hammer"
+
+  # Color constants using ANSI escape codes (no external libraries)
+  COLOR_RESET  = "\033[0m"
+  COLOR_RED    = "\033[31m"
+  COLOR_GREEN  = "\033[32m"
+  COLOR_YELLOW = "\033[33m"
+  COLOR_BLUE   = "\033[34m"
+  COLOR_BOLD   = "\033[1m"
 
   def self.main
     return usage if ARGV.empty?
@@ -36,7 +44,7 @@ module Hammer
 
   private def self.install_command(args : Array(String))
     parser = OptionParser.new do |parser|
-      parser.banner = "Usage: hammer install [options] <package>"
+      parser.banner = "#{COLOR_BLUE}Usage: hammer install [options] <package>#{COLOR_RESET}"
       parser.on("--atomic", "Install atomically in the system") { }
       parser.unknown_args do |unknown_args|
         if unknown_args.size != 1
@@ -49,6 +57,7 @@ module Hammer
     package = args[-1]? || ""
     atomic_flag = args.includes?("--atomic") ? ["--atomic"] : [] of String
     if package.empty?
+      puts "#{COLOR_RED}Error: Package name is required.#{COLOR_RESET}"
       puts parser
       exit(1)
     end
@@ -57,7 +66,7 @@ module Hammer
 
   private def self.remove_command(args : Array(String))
     parser = OptionParser.new do |parser|
-      parser.banner = "Usage: hammer remove [options] <package>"
+      parser.banner = "#{COLOR_BLUE}Usage: hammer remove [options] <package>#{COLOR_RESET}"
       parser.on("--atomic", "Remove atomically from the system") { }
       parser.unknown_args do |unknown_args|
         if unknown_args.size != 1
@@ -70,6 +79,7 @@ module Hammer
     package = args[-1]? || ""
     atomic_flag = args.includes?("--atomic") ? ["--atomic"] : [] of String
     if package.empty?
+      puts "#{COLOR_RED}Error: Package name is required.#{COLOR_RESET}"
       puts parser
       exit(1)
     end
@@ -78,7 +88,7 @@ module Hammer
 
   private def self.update_command(args : Array(String))
     if args.size != 0
-      puts "Usage: hammer update"
+      puts "#{COLOR_RED}Usage: hammer update#{COLOR_RESET}"
       exit(1)
     end
     run_updater("update", args)
@@ -86,7 +96,7 @@ module Hammer
 
   private def self.clean_command(args : Array(String))
     if args.size != 0
-      puts "Usage: hammer clean"
+      puts "#{COLOR_RED}Usage: hammer clean#{COLOR_RESET}"
       exit(1)
     end
     run_core("clean", args)
@@ -94,7 +104,7 @@ module Hammer
 
   private def self.refresh_command(args : Array(String))
     if args.size != 0
-      puts "Usage: hammer refresh"
+      puts "#{COLOR_RED}Usage: hammer refresh#{COLOR_RESET}"
       exit(1)
     end
     run_core("refresh", args)
@@ -102,7 +112,7 @@ module Hammer
 
   private def self.build_command(args : Array(String))
     if args.size != 0
-      puts "Usage: hammer build"
+      puts "#{COLOR_RED}Usage: hammer build#{COLOR_RESET}"
       exit(1)
     end
     run_builder("build", args)
@@ -110,7 +120,7 @@ module Hammer
 
   private def self.switch_command(args : Array(String))
     parser = OptionParser.new do |parser|
-      parser.banner = "Usage: hammer switch [deployment]"
+      parser.banner = "#{COLOR_BLUE}Usage: hammer switch [deployment]#{COLOR_RESET}"
       parser.unknown_args do |unknown_args|
         if unknown_args.size > 1
           puts parser
@@ -126,7 +136,7 @@ module Hammer
 
   private def self.deploy_command(args : Array(String))
     if args.size != 0
-      puts "Usage: hammer deploy"
+      puts "#{COLOR_RED}Usage: hammer deploy#{COLOR_RESET}"
       exit(1)
     end
     run_core("deploy", args)
@@ -134,7 +144,7 @@ module Hammer
 
   private def self.build_init_command(args : Array(String))
     if args.size != 0
-      puts "Usage: hammer build init"
+      puts "#{COLOR_RED}Usage: hammer build init#{COLOR_RESET}"
       exit(1)
     end
     run_builder("init", args)
@@ -142,7 +152,7 @@ module Hammer
 
   private def self.about_command(args : Array(String))
     if args.size != 0
-      puts "Usage: hammer about"
+      puts "#{COLOR_RED}Usage: hammer about#{COLOR_RESET}"
       exit(1)
     end
     about
@@ -164,30 +174,30 @@ module Hammer
   end
 
   private def self.about
-    puts "Hammer CLI Tool for HackerOS Atomic"
-    puts "Version: #{VERSION}"
-    puts "Description: Tool for managing atomic installations, updates, and builds inspired by apx and rpm-ostree."
-    puts "Components:"
-    puts "- hammer-core: Core operations in Rust"
-    puts "- hammer-updater: System updater in Crystal"
-    puts "- hammer-builder: ISO builder in Go"
-    puts "Location: #{HAMMER_PATH}"
+    puts "#{COLOR_BOLD}#{COLOR_BLUE}Hammer CLI Tool for HackerOS Atomic#{COLOR_RESET}"
+    puts "#{COLOR_GREEN}Version:#{COLOR_RESET} #{VERSION}"
+    puts "#{COLOR_GREEN}Description:#{COLOR_RESET} Tool for managing atomic installations, updates, and builds inspired by apx and rpm-ostree."
+    puts "#{COLOR_GREEN}Components:#{COLOR_RESET}"
+    puts "- #{COLOR_YELLOW}hammer-core:#{COLOR_RESET} Core operations in Rust"
+    puts "- #{COLOR_YELLOW}hammer-updater:#{COLOR_RESET} System updater in Crystal"
+    puts "- #{COLOR_YELLOW}hammer-builder:#{COLOR_RESET} ISO builder in Go"
+    puts "#{COLOR_GREEN}Location:#{COLOR_RESET} #{HAMMER_PATH}"
   end
 
   private def self.usage
-    puts "Usage: hammer <command> [options]"
+    puts "#{COLOR_BOLD}#{COLOR_BLUE}Usage: hammer <command> [options]#{COLOR_RESET}"
     puts ""
-    puts "Commands:"
-    puts " install [--atomic] <package> Install a package (optionally atomically)"
-    puts " remove [--atomic] <package> Remove a package (optionally atomically)"
-    puts " update Update the system atomically"
-    puts " clean Clean up unused resources"
-    puts " refresh Refresh repositories"
-    puts " build Build atomic ISO (must be in project dir)"
-    puts " switch [deployment] Switch to a deployment (rollback if no arg)"
-    puts " deploy Create a new deployment"
-    puts " build init Initialize build project"
-    puts " about Show tool information"
+    puts "#{COLOR_GREEN}Commands:#{COLOR_RESET}"
+    puts "  #{COLOR_YELLOW}install [--atomic] <package>#{COLOR_RESET}   Install a package (optionally atomically)"
+    puts "  #{COLOR_YELLOW}remove [--atomic] <package>#{COLOR_RESET}    Remove a package (optionally atomically)"
+    puts "  #{COLOR_YELLOW}update#{COLOR_RESET}                         Update the system atomically"
+    puts "  #{COLOR_YELLOW}clean#{COLOR_RESET}                          Clean up unused resources"
+    puts "  #{COLOR_YELLOW}refresh#{COLOR_RESET}                        Refresh repositories"
+    puts "  #{COLOR_YELLOW}build#{COLOR_RESET}                          Build atomic ISO (must be in project dir)"
+    puts "  #{COLOR_YELLOW}switch [deployment]#{COLOR_RESET}            Switch to a deployment (rollback if no arg)"
+    puts "  #{COLOR_YELLOW}deploy#{COLOR_RESET}                         Create a new deployment"
+    puts "  #{COLOR_YELLOW}build init#{COLOR_RESET}                     Initialize build project"
+    puts "  #{COLOR_YELLOW}about#{COLOR_RESET}                          Show tool information"
   end
 end
 
