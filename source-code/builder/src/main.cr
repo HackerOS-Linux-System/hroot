@@ -9,10 +9,8 @@ def main
     usage
     exit(1)
   end
-
   subcommand = ARGV[0]
   args = ARGV[1..]
-
   case subcommand
   when "init"
     init_project(args)
@@ -27,14 +25,12 @@ end
 def init_project(args : Array(String))
   suite = DEFAULT_SUITE
   atomic = true
-
   parser = OptionParser.new do |p|
     p.banner = "Usage: init [options]"
     p.on("--suite SUITE", "Debian suite: stable, testing, sid, or codename") { |s| suite = s }
     p.on("--no-atomic", "Disable atomic features") { atomic = false }
   end
   parser.parse(args)
-
   # Map common names to codenames
   actual_suite = suite
   case suite
@@ -45,15 +41,12 @@ def init_project(args : Array(String))
   when "sid"
     actual_suite = "sid"
   end
-
   puts "Initializing live-build project with suite: #{actual_suite} (atomic: #{atomic})"
-
   # Check if config exists
   if Dir.exists?("config")
     puts "Project already initialized."
     exit(1)
   end
-
   # Run lb config with more options for installer
   cmd_args = [
     "config",
@@ -73,11 +66,9 @@ def init_project(args : Array(String))
     puts "Failed to initialize: #{status.exit_reason}"
     exit(1)
   end
-
   # Create package lists
   pkg_lists_dir = File.join("config", "package-lists")
   FileUtils.mkdir_p(pkg_lists_dir)
-
   # Base packages for atomic system
   atomic_pkgs = [
     "btrfs-progs",
@@ -103,11 +94,9 @@ def init_project(args : Array(String))
   pkg_content = atomic_pkgs.join("\n") + "\n"
   pkg_file = File.join(pkg_lists_dir, "atomic.list.chroot")
   File.write(pkg_file, pkg_content)
-
   # Create hooks dir
   hooks_dir = File.join("config", "includes.chroot_after_packages/lib/live/config")
   FileUtils.mkdir_p(hooks_dir)
-
   # Hook for BTRFS and atomic setup
   hook_file = File.join(hooks_dir, "9999-setup-atomic.hook.chroot")
   hook_content = <<-HOOK
@@ -162,6 +151,24 @@ btrfs subvolume snapshot -r /mnt /mnt/btrfs-root/deployments/hammer-initial
 ln -s /btrfs-root/deployments/hammer-initial /btrfs-root/current
 # Update fstab
 genfstab -U /mnt >> /mnt/etc/fstab
+# Create init hook for transaction check
+mkdir -p /mnt/etc/initramfs-tools/hooks
+cat << EOH > /mnt/etc/initramfs-tools/hooks/hammer_transaction
+#!/bin/sh
+PREREQ=""
+prereqs() { echo "\$PREREQ"; }
+case \$1 in
+prereqs)
+    prereqs
+    exit 0
+    ;;
+esac
+. /usr/share/initramfs-tools/hook-functions
+copy_exec /usr/bin/hammer-core
+EOH
+chmod +x /mnt/etc/initramfs-tools/hooks/hammer_transaction
+# Update initramfs
+update-initramfs -u -k all
 EOF
 # Add unpackfs module adjustment if needed
 # Ensure Calamares sequence includes setupbtrfs after partition and before unpackfs
@@ -187,11 +194,9 @@ echo "Atomic setup completed."
 HOOK
   File.write(hook_file, hook_content)
   File.chmod(hook_file, 0o755)
-
   # Add includes for hammer binaries
   hammer_dir = File.join("config", "includes.chroot/usr/local/bin")
   FileUtils.mkdir_p(hammer_dir)
-
   # Placeholder: copy binaries if exist in current dir
   ["hammer", "hammer-core", "hammer-updater", "hammer-builder", "hammer-tui"].each do |bin|
     src = bin # Assume in current dir
@@ -203,11 +208,9 @@ HOOK
       puts "Warning: #{bin} not found, skipping."
     end
   end
-
   # Add boot loader config if needed
   bootloader_dir = File.join("config", "includes.binary/boot/grub")
   FileUtils.mkdir_p(bootloader_dir)
-
   # Custom grub config for BTRFS
   grub_cfg = File.join(bootloader_dir, "grub.cfg")
   grub_content = <<-GRUB
@@ -217,7 +220,18 @@ search --no-floppy --fs-uuid --set=root $rootuuid
 configfile /@root/boot/grub/grub.cfg
 GRUB
   File.write(grub_cfg, grub_content)
-
+  # Add grub.d script for dynamic entries
+  grubd_dir = File.join("config", "includes.chroot/etc/grub.d")
+  FileUtils.mkdir_p(grubd_dir)
+  grub_script = File.join(grubd_dir, "25_hammer_entries")
+  grub_script_content = <<-SCRIPT
+#!/bin/sh
+exec tail -n +3 $0
+# This file provides HammerOS deployment entries
+# Entries will be generated at runtime by hammer-core
+SCRIPT
+  File.write(grub_script, grub_script_content)
+  File.chmod(grub_script, 0o755)
   puts "Project initialized. Edit config/ as needed."
   puts "To include hammer binaries, place them in the current directory before init."
 end
@@ -227,15 +241,12 @@ def build_iso(args : Array(String))
     p.banner = "Usage: build [options]"
   end
   parser.parse(args)
-
   # Check if in project dir
   unless Dir.exists?("config")
     puts "Not in a live-build project directory. Run 'hammer-builder init' first."
     exit(1)
   end
-
   puts "Building ISO..."
-
   # Run lb clean first to ensure clean build
   clean_args = ["clean", "--purge"]
   status = Process.run("lb", clean_args, output: STDOUT, error: STDERR)
@@ -243,7 +254,6 @@ def build_iso(args : Array(String))
     puts "Failed to clean: #{status.exit_reason}"
     # Continue or exit?
   end
-
   # Run lb build
   build_args = ["build"]
   status = Process.run("lb", build_args, output: STDOUT, error: STDERR)
@@ -251,7 +261,6 @@ def build_iso(args : Array(String))
     puts "Failed to build: #{status.exit_reason}"
     exit(1)
   end
-
   puts "ISO built successfully. Find it as live-image-amd64.hybrid.iso or similar."
 end
 
