@@ -1,0 +1,9 @@
+name: hammer-builder
+version: 0.5
+
+authors:
+  - HackerOS Team <hackeros068@gmail.com>
+
+description: A tool to build atomic Debian ISO
+
+crystal: ">= 1.0.0"
