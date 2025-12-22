@@ -28,6 +28,17 @@ module HammerUpdater
     end
   end
 
+  private def self.ensure_top_mounted
+    mountpoint_output = run_command("mountpoint", ["-q", BTRFS_TOP])
+    return if mountpoint_output[:success]
+    Dir.mkdir(BTRFS_TOP) unless Dir.exists?(BTRFS_TOP)
+    findmnt_output = run_command("findmnt", ["-no", "SOURCE", "/"])
+    raise "Failed to find root device: #{findmnt_output[:stderr]}" unless findmnt_output[:success]
+    device = findmnt_output[:stdout].strip
+    mount_output = run_command("mount", ["-o", "subvol=/", device, BTRFS_TOP])
+    raise "Failed to mount btrfs top: #{mount_output[:stderr]}" unless mount_output[:success]
+  end
+
   private def self.acquire_lock
     if File.exists?(LOCK_FILE)
       raise "Hammer operation in progress (lock file exists)."
@@ -74,6 +85,7 @@ module HammerUpdater
     new_deployment : String? = nil
     mounted = false
     begin
+      ensure_top_mounted
       acquire_lock
       puts "Initializing system..."
       # Check btrfs
@@ -138,6 +150,7 @@ module HammerUpdater
   end
 
   private def self.update_system
+    ensure_top_mounted
     unless File.symlink?(CURRENT_SYMLINK)
       initialize_system
       puts "Please reboot the system and then run 'sudo hammer update' again."
