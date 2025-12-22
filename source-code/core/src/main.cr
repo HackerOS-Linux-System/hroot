@@ -121,6 +121,7 @@ def container_install(package : String)
   install_output = run_command(CONTAINER_TOOL, ["exec", "-it", container_name, "apt", "install", "-y", package])
   raise "Failed to install package in container: #{install_output[:stderr]}" unless install_output[:success]
   puts "Package #{package} installed in container successfully."
+  puts "To run: #{CONTAINER_TOOL} exec -it #{container_name} #{package}"
 end
 
 def container_remove(package : String)
