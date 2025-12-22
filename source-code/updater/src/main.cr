@@ -10,8 +10,13 @@ module HammerUpdater
   CURRENT_SYMLINK = "/btrfs-root/current"
   LOCK_FILE = "/run/hammer.lock"
   TRANSACTION_MARKER = "/btrfs-root/hammer-transaction"
+  BTRFS_TOP = "/btrfs-root"
 
   def self.main
+    if LibC.getuid != 0
+      puts "This tool must be run as root."
+      exit(1)
+    end
     return usage if ARGV.empty?
     command = ARGV.shift
     case command
@@ -65,7 +70,74 @@ module HammerUpdater
     update_system
   end
 
+  private def self.initialize_system
+    new_deployment : String? = nil
+    mounted = false
+    begin
+      acquire_lock
+      puts "Initializing system..."
+      # Check btrfs
+      output = run_command("btrfs", ["filesystem", "show", "/"])
+      raise "Root filesystem is not BTRFS." unless output[:success]
+      # Get current default subvolume path
+      default_output = run_command("btrfs", ["subvolume", "get-default", "/"])
+      raise "Failed to get default subvolume: #{default_output[:stderr]}" unless default_output[:success]
+      match = default_output[:stdout].match(/path (.*)$/)
+      raise "Unable to parse subvolume path." unless match
+      current_subvol = match[1].strip
+      current_path = if current_subvol.empty?
+                       BTRFS_TOP
+                     else
+                       "#{BTRFS_TOP}/#{current_subvol}"
+                     end
+      # Create deployments subvolume if not exists
+      unless File.exists?(DEPLOYMENTS_DIR)
+        output = run_command("btrfs", ["subvolume", "create", DEPLOYMENTS_DIR])
+        raise "Failed to create deployments subvolume: #{output[:stderr]}" unless output[:success]
+      end
+      # Create new deployment snapshot (writable)
+      timestamp = Time.local.to_s("%Y%m%d%H%M%S")
+      new_deployment = "#{DEPLOYMENTS_DIR}/hammer-#{timestamp}"
+      output = run_command("btrfs", ["subvolume", "snapshot", current_path, new_deployment])
+      raise "Failed to create initial deployment: #{output[:stderr]}" unless output[:success]
+      # Bind mounts for chroot
+      bind_mounts_for_chroot(new_deployment, true)
+      mounted = true
+      # Run commands in chroot
+      chroot_cmd = "chroot #{new_deployment} /bin/bash -c 'dpkg -l > /tmp/packages.list && update-initramfs -u -k all && update-grub'"
+      output = run_command("/bin/bash", ["-c", chroot_cmd])
+      raise "Failed in chroot for initial setup: #{output[:stderr]}" unless output[:success]
+      bind_mounts_for_chroot(new_deployment, false)
+      mounted = false
+      kernel = get_kernel_version(new_deployment)
+      sanity_check(new_deployment, kernel)
+      system_version = compute_system_version(new_deployment)
+      write_meta(new_deployment, "initial", current_subvol, kernel, system_version, "ready")
+      update_bootloader_entries(new_deployment)
+      set_subvolume_readonly(new_deployment, true)
+      create_transaction_marker(new_deployment)
+      switch_to_deployment(new_deployment)
+      # Do not remove transaction marker; it will be handled on boot
+      puts "System initialized. Please reboot to apply the initial deployment."
+    rescue ex : Exception
+      if new_deployment
+        set_status_broken(new_deployment)
+      end
+      raise ex
+    ensure
+      if mounted && new_deployment
+        bind_mounts_for_chroot(new_deployment, false) rescue nil
+      end
+      release_lock
+    end
+  end
+
   private def self.update_system
+    unless File.symlink?(CURRENT_SYMLINK)
+      initialize_system
+      puts "Please reboot the system and then run 'sudo hammer update' again."
+      return
+    end
     new_deployment : String? = nil
     mounted = false
     begin
@@ -262,10 +334,8 @@ module HammerUpdater
     end.sort_by do |dep|
       Time.parse_rfc3339(read_meta(dep)["created"]? || "1970-01-01T00:00:00Z")
     end.reverse[0...5] # Limit to last 5 good deployments
-
     entries = [] of String
     uuid = get_fs_uuid
-
     good_deployments.each do |dep|
       name = File.basename(dep)
       meta = read_meta(dep)
@@ -284,14 +354,12 @@ menuentry 'HammerOS (#{name})' --class gnu-linux --class gnu --class os $menuent
 ENTRY
       entries << entry
     end
-
     script_content = <<-SCRIPT
 #!/bin/sh
 exec tail -n +3 $0
 # This file provides HammerOS deployment entries
 #{entries.join("\n")}
 SCRIPT
-
     grub_file = "#{deployment}/etc/grub.d/25_hammer_entries"
     File.write(grub_file, script_content)
     File.chmod(grub_file, 0o755)
