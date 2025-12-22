@@ -4,6 +4,11 @@ require "time"
 require "json"
 require "digest/sha256"
 
+if LibC.getuid != 0
+  puts "This tool must be run as root."
+  exit(1)
+end
+
 CONTAINER_TOOL = "podman"
 CONTAINER_NAME_PREFIX = "hammer-container-"
 CONTAINER_IMAGE = "debian:stable"
@@ -116,9 +121,9 @@ end
 def container_install(package : String)
   container_name = CONTAINER_NAME_PREFIX + "default"
   ensure_container_exists(container_name)
-  update_output = run_command(CONTAINER_TOOL, ["exec", "-it", container_name, "apt", "update", "-y"])
+  update_output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "update"])
   raise "Failed to update in container: #{update_output[:stderr]}" unless update_output[:success]
-  install_output = run_command(CONTAINER_TOOL, ["exec", "-it", container_name, "apt", "install", "-y", package])
+  install_output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "install", "-y", package])
   raise "Failed to install package in container: #{install_output[:stderr]}" unless install_output[:success]
   puts "Package #{package} installed in container successfully."
   puts "To run: #{CONTAINER_TOOL} exec -it #{container_name} #{package}"
@@ -127,7 +132,7 @@ end
 def container_remove(package : String)
   container_name = CONTAINER_NAME_PREFIX + "default"
   ensure_container_exists(container_name)
-  output = run_command(CONTAINER_TOOL, ["exec", "-it", container_name, "apt", "remove", "-y", package])
+  output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "remove", "-y", package])
   raise "Failed to remove package from container: #{output[:stderr]}" unless output[:success]
   puts "Package #{package} removed from container successfully."
 end
@@ -287,7 +292,7 @@ def refresh
     puts "Refreshing container metadata..."
     container_name = CONTAINER_NAME_PREFIX + "default"
     ensure_container_exists(container_name)
-    output = run_command(CONTAINER_TOOL, ["exec", "-it", container_name, "apt", "update", "-y"])
+    output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "update"])
     raise "Failed to refresh: #{output[:stderr]}" unless output[:success]
     puts "Refresh completed."
   ensure
