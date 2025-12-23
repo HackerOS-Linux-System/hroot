@@ -2,7 +2,7 @@ require "option_parser"
 
 module Hammer
   VERSION = "0.4" # Updated version for expansions
-  HAMMER_PATH = "#{ENV["HOME"]? || "/home/user"}/.hackeros/hammer"
+  HAMMER_PATH = "/usr/lib/HackerOS/hammer/bin"
   # Color constants using ANSI escape codes (no external libraries)
   COLOR_RESET = "\033[0m"
   COLOR_RED = "\033[31m"
@@ -53,6 +53,7 @@ module Hammer
     parser = OptionParser.new do |parser|
       parser.banner = "#{COLOR_BLUE}Usage: hammer install [options] <package>#{COLOR_RESET}"
       parser.on("--atomic", "Install atomically in the system") { }
+      parser.on("--gui", "Install as GUI application") { }
       parser.unknown_args do |unknown_args|
         if unknown_args.size != 1
           puts parser
@@ -63,18 +64,20 @@ module Hammer
     parser.parse(args.dup)
     package = args[-1]? || ""
     atomic_flag = args.includes?("--atomic") ? ["--atomic"] : [] of String
+    gui_flag = args.includes?("--gui") ? ["--gui"] : [] of String
     if package.empty?
       puts "#{COLOR_RED}Error: Package name is required.#{COLOR_RESET}"
       puts parser
       exit(1)
     end
-    run_core("install", atomic_flag + [package])
+    run_core("install", atomic_flag + gui_flag + [package])
   end
 
   private def self.remove_command(args : Array(String))
     parser = OptionParser.new do |parser|
       parser.banner = "#{COLOR_BLUE}Usage: hammer remove [options] <package>#{COLOR_RESET}"
       parser.on("--atomic", "Remove atomically from the system") { }
+      parser.on("--gui", "Remove as GUI application") { }
       parser.unknown_args do |unknown_args|
         if unknown_args.size != 1
           puts parser
@@ -85,12 +88,13 @@ module Hammer
     parser.parse(args.dup)
     package = args[-1]? || ""
     atomic_flag = args.includes?("--atomic") ? ["--atomic"] : [] of String
+    gui_flag = args.includes?("--gui") ? ["--gui"] : [] of String
     if package.empty?
       puts "#{COLOR_RED}Error: Package name is required.#{COLOR_RESET}"
       puts parser
       exit(1)
     end
-    run_core("remove", atomic_flag + [package])
+    run_core("remove", atomic_flag + gui_flag + [package])
   end
 
   private def self.update_command(args : Array(String))
@@ -240,8 +244,8 @@ module Hammer
     puts "#{COLOR_BOLD}#{COLOR_BLUE}Usage: hammer <command> [options]#{COLOR_RESET}"
     puts ""
     puts "#{COLOR_GREEN}Commands:#{COLOR_RESET}"
-    puts " #{COLOR_YELLOW}install [--atomic] <package>#{COLOR_RESET} Install a package (optionally atomically)"
-    puts " #{COLOR_YELLOW}remove [--atomic] <package>#{COLOR_RESET} Remove a package (optionally atomically)"
+    puts " #{COLOR_YELLOW}install [--atomic] [--gui] <package>#{COLOR_RESET} Install a package (optionally atomically or as GUI)"
+    puts " #{COLOR_YELLOW}remove [--atomic] [--gui] <package>#{COLOR_RESET} Remove a package (optionally atomically or as GUI)"
     puts " #{COLOR_YELLOW}update#{COLOR_RESET} Update the system atomically"
     puts " #{COLOR_YELLOW}clean#{COLOR_RESET} Clean up unused resources"
     puts " #{COLOR_YELLOW}refresh#{COLOR_RESET} Refresh repositories"
