@@ -145,11 +145,11 @@ def container_install(package : String, gui : Bool)
       content_output = run_command(CONTAINER_TOOL, ["exec", container_name, "cat", df])
       if content_output[:success]
         desktop_content = content_output[:stdout]
-        # Modify Exec= to prefix with podman exec
+        # Modify Exec= to prefix with sudo podman exec, including start check
         new_content = desktop_content.lines.map do |line|
           if line.starts_with?("Exec=")
             exec_cmd = line[5..].strip
-            "Exec=#{CONTAINER_TOOL} exec #{container_name} #{exec_cmd}"
+            "Exec=sh -c \"sudo #{CONTAINER_TOOL} ps --filter name=^#{container_name}$ --filter status=running -q | grep -q . || sudo #{CONTAINER_TOOL} start #{container_name}; sudo #{CONTAINER_TOOL} exec #{container_name} #{exec_cmd}\""
           else
             line
           end
@@ -181,13 +181,14 @@ def container_install(package : String, gui : Bool)
     wrapper_path = "/usr/bin/#{package}"
     wrapper_content = <<-WRAPPER
 #!/bin/sh
-#{CONTAINER_TOOL} exec #{container_name} #{package} "$@"
+sudo #{CONTAINER_TOOL} ps --filter name=^#{container_name}$ --filter status=running -q | grep -q . || sudo #{CONTAINER_TOOL} start #{container_name}
+sudo #{CONTAINER_TOOL} exec #{container_name} #{package} "$@"
 WRAPPER
     File.write(wrapper_path, wrapper_content)
     File.chmod(wrapper_path, 0o755)
     puts "Created CLI wrapper: #{wrapper_path}"
   end
-  puts "To run manually: #{CONTAINER_TOOL} exec -it #{container_name} #{package}"
+  puts "To run manually: sudo #{CONTAINER_TOOL} exec -it #{container_name} #{package}"
 end
 
 def container_remove(package : String, gui : Bool)
@@ -199,21 +200,23 @@ def container_remove(package : String, gui : Bool)
     puts "Package #{package} is not installed in the container."
     return
   end
-  output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "remove", "-y", package])
-  raise "Failed to remove package from container: #{output[:stderr]}" unless output[:success]
+  # Get files list before remove for GUI
+  files_output = {success: false, stdout: "", stderr: ""}
+  if gui
+    files_output = run_command(CONTAINER_TOOL, ["exec", container_name, "dpkg", "-L", package])
+    raise "Failed to list package files: #{files_output[:stderr]}" unless files_output[:success]
+  end
+  remove_output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "remove", "-y", package])
+  raise "Failed to remove package from container: #{remove_output[:stderr]}" unless remove_output[:success]
   puts "Package #{package} removed from container successfully."
   # Remove wrappers or .desktop files
   if gui
-    # Find and remove .desktop files
-    files_output = run_command(CONTAINER_TOOL, ["exec", container_name, "dpkg", "-L", package])
-    if files_output[:success]
-      files = files_output[:stdout].lines.map(&.strip)
-      desktop_files = files.select { |f| f.ends_with?(".desktop") && f.starts_with?("/usr/share/applications/") }
-      desktop_files.each do |df|
-        host_df = "/usr/share/applications/#{File.basename(df)}"
-        File.delete(host_df) if File.exists?(host_df)
-        puts "Removed .desktop file: #{host_df}"
-      end
+    files = files_output[:stdout].lines.map(&.strip)
+    desktop_files = files.select { |f| f.ends_with?(".desktop") && f.starts_with?("/usr/share/applications/") }
+    desktop_files.each do |df|
+      host_df = "/usr/share/applications/#{File.basename(df)}"
+      File.delete(host_df) if File.exists?(host_df)
+      puts "Removed .desktop file: #{host_df}"
     end
   else
     # Remove CLI wrapper
@@ -237,14 +240,14 @@ def atomic_install(package : String, gui : Bool)
     bind_mounts_for_chroot(new_deployment, true)
     mounted = true
     # Check if already installed in chroot
-    check_cmd = "chroot #{new_deployment} /bin/bash -c 'dpkg -s #{package}'"
-    check_output = run_command("/bin/bash", ["-c", check_cmd])
+    check_cmd = "chroot #{new_deployment} /bin/sh -c 'dpkg -s #{package}'"
+    check_output = run_command("/bin/sh", ["-c", check_cmd])
     if check_output[:success]
       puts "Package #{package} is already installed in the system."
       raise "Already installed" # To trigger cleanup
     end
-    chroot_cmd = "chroot #{new_deployment} /bin/bash -c 'apt update && apt install -y #{package} && apt autoremove -y && dpkg -l > /tmp/packages.list && update-initramfs -u -k all && update-grub'"
-    output = run_command("/bin/bash", ["-c", chroot_cmd])
+    chroot_cmd = "chroot #{new_deployment} /bin/sh -c 'apt update && apt install -y #{package} && apt autoremove -y && dpkg -l > /tmp/packages.list && update-initramfs -u -k all && update-grub'"
+    output = run_command("/bin/sh", ["-c", chroot_cmd])
     if !output[:success]
       raise "Failed to install in chroot: #{output[:stderr]}"
     end
@@ -286,14 +289,14 @@ def atomic_remove(package : String, gui : Bool)
     bind_mounts_for_chroot(new_deployment, true)
     mounted = true
     # Check if installed in chroot
-    check_cmd = "chroot #{new_deployment} /bin/bash -c 'dpkg -s #{package}'"
-    check_output = run_command("/bin/bash", ["-c", check_cmd])
+    check_cmd = "chroot #{new_deployment} /bin/sh -c 'dpkg -s #{package}'"
+    check_output = run_command("/bin/sh", ["-c", check_cmd])
     unless check_output[:success]
       puts "Package #{package} is not installed in the system."
       raise "Not installed" # To trigger cleanup
     end
-    chroot_cmd = "chroot #{new_deployment} /bin/bash -c 'apt remove -y #{package} && apt autoremove -y && dpkg -l > /tmp/packages.list && update-initramfs -u -k all && update-grub'"
-    output = run_command("/bin/bash", ["-c", chroot_cmd])
+    chroot_cmd = "chroot #{new_deployment} /bin/sh -c 'apt remove -y #{package} && apt autoremove -y && dpkg -l > /tmp/packages.list && update-initramfs -u -k all && update-grub'"
+    output = run_command("/bin/sh", ["-c", chroot_cmd])
     if !output[:success]
       raise "Failed to remove in chroot: #{output[:stderr]}"
     end
@@ -404,9 +407,30 @@ end
 
 def ensure_container_exists(container_name : String)
   exists_output = run_command(CONTAINER_TOOL, ["container", "exists", container_name])
+  newly_created = false
   if !exists_output[:success]
     create_output = run_command(CONTAINER_TOOL, ["run", "-d", "--name", container_name, CONTAINER_IMAGE, "sleep", "infinity"])
     raise "Failed to create container: #{create_output[:stderr]}" unless create_output[:success]
+    newly_created = true
+  end
+  # Setup apt sources if newly created
+  if newly_created
+    sed_args = ["exec", container_name, "sed", "-i", "s/main$/main contrib non-free non-free-firmware/g", "/etc/apt/sources.list"]
+    setup_output = run_command(CONTAINER_TOOL, sed_args)
+    unless setup_output[:success]
+      puts "Warning: Failed to setup apt sources: #{setup_output[:stderr]}"
+    end
+    update_output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "update"])
+    unless update_output[:success]
+      raise "Failed to initial apt update in container: #{update_output[:stderr]}"
+    end
+    # Set up sudoers for podman commands
+    sudoers_path = "/etc/sudoers.d/hammer-podman"
+    sudoers_content = <<-SUDOERS
+%sudo ALL=(ALL) NOPASSWD: /usr/bin/podman start #{container_name}, /usr/bin/podman exec #{container_name} *, /usr/bin/podman ps --filter name=^#{container_name}$ --filter status=running -q
+SUDOERS
+    File.write(sudoers_path, sudoers_content)
+    File.chmod(sudoers_path, 0o440)
   end
   # Check if running
   running_output = run_command(CONTAINER_TOOL, ["ps", "-q", "-f", "name=^#{container_name}$"])
@@ -455,8 +479,8 @@ def bind_mounts_for_chroot(chroot_path : String, mount : Bool)
 end
 
 def get_kernel_version(chroot_path : String) : String
-  cmd = "chroot #{chroot_path} /bin/bash -c \"dpkg -l | grep ^ii | grep linux-image | awk '{print \\$3}' | sort -V | tail -1\""
-  output = run_command("/bin/bash", ["-c", cmd])
+  cmd = "chroot #{chroot_path} /bin/sh -c \"dpkg -l | grep ^ii | grep linux-image | awk '{print \\$3}' | sort -V | tail -1\""
+  output = run_command("/bin/sh", ["-c", cmd])
   raise "Failed to get kernel version: #{output[:stderr]}" unless output[:success]
   output[:stdout].strip
 end
@@ -582,7 +606,7 @@ def sanity_check(deployment : String, kernel : String)
   end
   # Check fstab
   cmd = "chroot #{deployment} /bin/mount -f -a"
-  output = run_command("/bin/bash", ["-c", cmd])
+  output = run_command("/bin/sh", ["-c", cmd])
   raise "Fstab sanity check failed: #{output[:stderr]}" unless output[:success]
 end
 
@@ -651,58 +675,63 @@ if ARGV.empty?
   puts "No subcommand was used"
 else
   subcommand = ARGV.shift
-  case subcommand
-  when "install"
-    matches = parse_install_remove(ARGV)
-    install_package(matches[:package], matches[:atomic], matches[:gui])
-  when "remove"
-    matches = parse_install_remove(ARGV)
-    remove_package(matches[:package], matches[:atomic], matches[:gui])
-  when "deploy"
-    begin
-      acquire_lock
-      validate_system
-      new_deployment = create_deployment(true)
-      create_transaction_marker(new_deployment)
-      parent = File.basename(File.readlink(CURRENT_SYMLINK))
-      bind_mounts_for_chroot(new_deployment, true)
-      chroot_cmd = "chroot #{new_deployment} /bin/bash -c 'dpkg -l > /tmp/packages.list && update-initramfs -u -k all && update-grub'"
-      output = run_command("/bin/bash", ["-c", chroot_cmd])
-      raise "Failed in chroot: #{output[:stderr]}" unless output[:success]
-      bind_mounts_for_chroot(new_deployment, false)
-      kernel = get_kernel_version(new_deployment)
-      sanity_check(new_deployment, kernel)
-      system_version = compute_system_version(new_deployment)
-      write_meta(new_deployment, "deploy", parent, kernel, system_version, "ready")
-      update_bootloader_entries(new_deployment)
-      set_subvolume_readonly(new_deployment, true)
-      switch_to_deployment(new_deployment)
-      remove_transaction_marker
-    rescue ex : Exception
-      if new_deployment
-        set_status_broken(new_deployment)
+  begin
+    case subcommand
+    when "install"
+      matches = parse_install_remove(ARGV)
+      install_package(matches[:package], matches[:atomic], matches[:gui])
+    when "remove"
+      matches = parse_install_remove(ARGV)
+      remove_package(matches[:package], matches[:atomic], matches[:gui])
+    when "deploy"
+      begin
+        acquire_lock
+        validate_system
+        new_deployment = create_deployment(true)
+        create_transaction_marker(new_deployment)
+        parent = File.basename(File.readlink(CURRENT_SYMLINK))
+        bind_mounts_for_chroot(new_deployment, true)
+        chroot_cmd = "chroot #{new_deployment} /bin/sh -c 'dpkg -l > /tmp/packages.list && update-initramfs -u -k all && update-grub'"
+        output = run_command("/bin/sh", ["-c", chroot_cmd])
+        raise "Failed in chroot: #{output[:stderr]}" unless output[:success]
+        bind_mounts_for_chroot(new_deployment, false)
+        kernel = get_kernel_version(new_deployment)
+        sanity_check(new_deployment, kernel)
+        system_version = compute_system_version(new_deployment)
+        write_meta(new_deployment, "deploy", parent, kernel, system_version, "ready")
+        update_bootloader_entries(new_deployment)
+        set_subvolume_readonly(new_deployment, true)
+        switch_to_deployment(new_deployment)
+        remove_transaction_marker
+      rescue ex : Exception
+        if new_deployment
+          set_status_broken(new_deployment)
+        end
+        raise ex
+      ensure
+        release_lock
       end
-      raise ex
-    ensure
-      release_lock
+    when "switch"
+      deployment = parse_switch(ARGV)
+      switch_deployment(deployment)
+    when "clean"
+      clean_up
+    when "refresh"
+      refresh
+    when "status"
+      hammer_status
+    when "history"
+      hammer_history
+    when "rollback"
+      n = parse_rollback(ARGV)
+      hammer_rollback(n)
+    when "check-transaction"
+      hammer_check_transaction
+    else
+      puts "Unknown subcommand: #{subcommand}"
     end
-  when "switch"
-    deployment = parse_switch(ARGV)
-    switch_deployment(deployment)
-  when "clean"
-    clean_up
-  when "refresh"
-    refresh
-  when "status"
-    hammer_status
-  when "history"
-    hammer_history
-  when "rollback"
-    n = parse_rollback(ARGV)
-    hammer_rollback(n)
-  when "check-transaction"
-    hammer_check_transaction
-  else
-    puts "Unknown subcommand: #{subcommand}"
+  rescue ex : Exception
+    STDERR.puts "Error: #{ex.message}"
+    exit(1)
   end
 end
