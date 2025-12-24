@@ -24,10 +24,12 @@ end
 
 def init_project(args : Array(String))
   suite = DEFAULT_SUITE
+  edition = "atomic"
   atomic = true
   parser = OptionParser.new do |p|
     p.banner = "Usage: init [options]"
-    p.on("--suite SUITE", "Debian suite: stable, testing, sid, or codename") { |s| suite = s }
+    p.on("--suite SUITE", "Debian suite: stable, testing, unstable, or codename") { |s| suite = s }
+    p.on("--edition EDITION", "Desktop edition: atomic, hydra, gnome, xfce, wayfire") { |e| edition = e }
     p.on("--no-atomic", "Disable atomic features") { atomic = false }
   end
   parser.parse(args)
@@ -35,13 +37,13 @@ def init_project(args : Array(String))
   actual_suite = suite
   case suite
   when "stable"
-    actual_suite = "bookworm" # Update to current stable
-  when "testing"
     actual_suite = "trixie"
-  when "sid"
+  when "testing"
+    actual_suite = "forky"
+  when "unstable"
     actual_suite = "sid"
   end
-  puts "Initializing live-build project with suite: #{actual_suite} (atomic: #{atomic})"
+  puts "Initializing live-build project with suite: #{actual_suite}, edition: #{edition} (atomic: #{atomic})"
   # Check if config exists
   if Dir.exists?("config")
     puts "Project already initialized."
@@ -56,6 +58,7 @@ def init_project(args : Array(String))
     "--debian-installer", "live", # Enable installer
     "--archive-areas", "main contrib non-free non-free-firmware",
     "--debootstrap-options", "--variant=minbase",
+    "--apt-options", "--allow-unauthenticated --yes",
     "--firmware-binary", "true",
     "--firmware-chroot", "true",
     "--linux-flavours", "amd64",
@@ -91,15 +94,68 @@ def init_project(args : Array(String))
     "parted",
     # Add more as needed
   ]
-  pkg_content = atomic_pkgs.join("\n") + "\n"
-  pkg_file = File.join(pkg_lists_dir, "atomic.list.chroot")
+  # DE packages based on edition
+  de_pkgs = [] of String
+  case edition
+  when "atomic", "hydra"
+    de_pkgs = [
+      "kde-plasma-desktop",
+      "plasma-nm",
+      "sddm",
+      "konsole",
+      "dolphin",
+      "ark",
+      "kate",
+      "kio-extras",
+      "plasma-discover",
+      "plasma-workspace-wallpapers",
+      # Add more Plasma essentials as needed
+    ]
+  when "gnome"
+    de_pkgs = [
+      "gnome",
+      "gdm3",
+      # Add more GNOME specifics if needed
+    ]
+  when "xfce"
+    de_pkgs = [
+      "xfce4",
+      "xfce4-goodies",
+      "lightdm",
+      # Add more XFCE essentials
+    ]
+  when "wayfire"
+    de_pkgs = [
+      "wayfire",
+      "wf-shell",
+      "wf-config",
+      "sddm",
+      # Add more Wayfire dependencies as needed
+    ]
+  else
+    puts "Unknown edition: #{edition}"
+    exit(1)
+  end
+  pkg_content = (atomic ? atomic_pkgs : [] of String).join("\n") + "\n" + de_pkgs.join("\n") + "\n"
+  pkg_file = File.join(pkg_lists_dir, "base.list.chroot")
   File.write(pkg_file, pkg_content)
-  # Create hooks dir
-  hooks_dir = File.join("config", "includes.chroot_after_packages/lib/live/config")
-  FileUtils.mkdir_p(hooks_dir)
-  # Hook for BTRFS and atomic setup
-  hook_file = File.join(hooks_dir, "9999-setup-atomic.hook.chroot")
-  hook_content = <<-HOOK
+  # For hydra edition, download look-and-feel offline
+  if edition == "hydra"
+    hydra_dir = File.join("config", "includes.chroot/tmp/hydra-look-and-feel")
+    FileUtils.mkdir_p(File.dirname(hydra_dir))
+    status = Process.run("git", ["clone", "https://github.com/HackerOS-Linux-System/hydra-look-and-feel.git", hydra_dir], output: STDOUT, error: STDERR)
+    unless status.success?
+      puts "Failed to clone hydra-look-and-feel: #{status.exit_reason}"
+      exit(1)
+    end
+  end
+  # Create hooks dir if atomic
+  if atomic
+    hooks_dir = File.join("config", "includes.chroot_after_packages/lib/live/config")
+    FileUtils.mkdir_p(hooks_dir)
+    # Hook for BTRFS and atomic setup
+    hook_file = File.join(hooks_dir, "9999-setup-atomic.hook.chroot")
+    hook_content = <<-HOOK
 #!/bin/sh
 set -e
 echo "Setting up atomic features..."
@@ -108,7 +164,7 @@ su - hacker -c "podman system migrate" || true
 # Set up directories for deployments
 mkdir -p /btrfs-root/deployments
 # Install hammer tools (assuming binaries are included)
-echo "Hammer tools will be installed in /usr/local/bin/hammer"
+echo "Hammer tools will be installed in /usr/bin/"
 # Configure Calamares for atomic BTRFS setup
 if [ -d /usr/share/calamares ]; then
 echo "Configuring Calamares for atomic BTRFS..."
@@ -156,8 +212,8 @@ mkdir -p /mnt/etc/initramfs-tools/hooks
 cat << EOH > /mnt/etc/initramfs-tools/hooks/hammer_transaction
 #!/bin/sh
 PREREQ=""
-prereqs() { echo "\$PREREQ"; }
-case \$1 in
+prereqs() { echo "\\$PREREQ"; }
+case \\$1 in
 prereqs)
     prereqs
     exit 0
@@ -190,22 +246,34 @@ sequence:
 EOF
 fi
 # Make sure /etc/fstab has correct subvol mounts
+HOOK
+    # Add hydra specific setup if edition is hydra
+    if edition == "hydra"
+      hook_content += <<-HYDRA
+# Apply hydra look and feel
+echo "Applying hydra look and feel..."
+cp -r /tmp/hydra-look-and-feel/files/* /
+rm -rf /tmp/hydra-look-and-feel
+HYDRA
+    end
+    hook_content += <<-HOOK
 echo "Atomic setup completed."
 HOOK
-  File.write(hook_file, hook_content)
-  File.chmod(hook_file, 0o755)
+    File.write(hook_file, hook_content)
+    File.chmod(hook_file, 0o755)
+  end
   # Add includes for hammer binaries
-  hammer_dir = File.join("config", "includes.chroot/usr/local/bin")
+  hammer_dir = File.join("config", "includes.chroot/usr/bin")
   FileUtils.mkdir_p(hammer_dir)
-  # Placeholder: copy binaries if exist in current dir
-  ["hammer", "hammer-core", "hammer-updater", "hammer-builder", "hammer-tui"].each do |bin|
-    src = bin # Assume in current dir
+  # Copy binaries from /usr/lib/HackerOS/hammer/bin/
+  ["hammer-builder", "hammer-core", "hammer-tui", "hammer-updater", "hammer-progress-bar"].each do |bin|
+    src = File.join("/usr/lib/HackerOS/hammer/bin", bin)
     if File.exists?(src)
       dst = File.join(hammer_dir, bin)
       FileUtils.cp(src, dst)
       File.chmod(dst, 0o755)
     else
-      puts "Warning: #{bin} not found, skipping."
+      puts "Warning: #{src} not found, skipping."
     end
   end
   # Add boot loader config if needed
@@ -233,7 +301,6 @@ SCRIPT
   File.write(grub_script, grub_script_content)
   File.chmod(grub_script, 0o755)
   puts "Project initialized. Edit config/ as needed."
-  puts "To include hammer binaries, place them in the current directory before init."
 end
 
 def build_iso(args : Array(String))
@@ -248,15 +315,15 @@ def build_iso(args : Array(String))
   end
   puts "Building ISO..."
   # Run lb clean first to ensure clean build
-  clean_args = ["clean", "--purge"]
-  status = Process.run("lb", clean_args, output: STDOUT, error: STDERR)
+  puts "Cleaning with sudo lb clean --purge..."
+  status = Process.run("sudo", ["lb", "clean", "--purge"], output: STDOUT, error: STDERR)
   unless status.success?
     puts "Failed to clean: #{status.exit_reason}"
     # Continue or exit?
   end
   # Run lb build
-  build_args = ["build"]
-  status = Process.run("lb", build_args, output: STDOUT, error: STDERR)
+  puts "Building with sudo lb build..."
+  status = Process.run("sudo", ["lb", "build"], output: STDOUT, error: STDERR)
   unless status.success?
     puts "Failed to build: #{status.exit_reason}"
     exit(1)
@@ -268,7 +335,7 @@ def usage
   puts "Usage: hammer-builder <command> [options]"
   puts ""
   puts "Commands:"
-  puts " init [--suite <suite>] [--no-atomic] Initialize live-build project"
+  puts " init [--suite <suite>] [--edition <edition>] [--no-atomic] Initialize live-build project"
   puts " build Build the atomic ISO"
 end
 
