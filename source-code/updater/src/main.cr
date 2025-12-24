@@ -95,10 +95,12 @@ module HammerUpdater
       default_output = run_command("btrfs", ["subvolume", "get-default", "/"])
       raise "Failed to get default subvolume: #{default_output[:stderr]}" unless default_output[:success]
       output_str = default_output[:stdout].strip
-      if output_str.includes?("ID 5 (FS_TREE)")
-        current_subvol = ""
-      elsif match = output_str.match(/path (.*)$/)
+      current_subvol = ""
+      if match = output_str.match(/path (.*)$/)
         current_subvol = match[1].strip
+        if current_subvol == "<FS_TREE>"
+          current_subvol = ""
+        end
       else
         raise "Unable to parse subvolume path."
       end
@@ -121,8 +123,8 @@ module HammerUpdater
       bind_mounts_for_chroot(new_deployment, true)
       mounted = true
       # Run commands in chroot
-      chroot_cmd = "chroot #{new_deployment} /bin/bash -c 'dpkg -l > /tmp/packages.list && update-initramfs -u -k all && update-grub'"
-      output = run_command("/bin/bash", ["-c", chroot_cmd])
+      chroot_cmd = "chroot #{new_deployment} /bin/sh -c 'dpkg -l > /tmp/packages.list && update-initramfs -u -k all && update-grub'"
+      output = run_command("/bin/sh", ["-c", chroot_cmd])
       raise "Failed in chroot for initial setup: #{output[:stderr]}" unless output[:success]
       bind_mounts_for_chroot(new_deployment, false)
       mounted = false
@@ -169,8 +171,8 @@ module HammerUpdater
       create_transaction_marker(new_deployment)
       bind_mounts_for_chroot(new_deployment, true)
       mounted = true
-      chroot_cmd = "chroot #{new_deployment} /bin/bash -c 'apt update && apt upgrade -y -o Dpkg::Options::=\"--force-confold\" && apt autoremove -y && dpkg -l > /tmp/packages.list && update-initramfs -u -k all && update-grub'"
-      output = run_command("/bin/bash", ["-c", chroot_cmd])
+      chroot_cmd = "chroot #{new_deployment} /bin/sh -c 'apt update && apt upgrade -y -o Dpkg::Options::=\"--force-confold\" && apt autoremove -y && dpkg -l > /tmp/packages.list && update-initramfs -u -k all && update-grub'"
+      output = run_command("/bin/sh", ["-c", chroot_cmd])
       if !output[:success]
         raise "Failed to update in chroot: #{output[:stderr]}"
       end
@@ -230,8 +232,8 @@ module HammerUpdater
   end
 
   private def self.get_kernel_version(chroot_path : String) : String
-    cmd = "chroot #{chroot_path} /bin/bash -c \"dpkg -l | grep ^ii | grep linux-image | awk '{print \\$3}' | sort -V | tail -1\""
-    output = run_command("/bin/bash", ["-c", cmd])
+    cmd = "chroot #{chroot_path} /bin/sh -c \"dpkg -l | grep ^ii | grep linux-image | awk '{print \\$3}' | sort -V | tail -1\""
+    output = run_command("/bin/sh", ["-c", cmd])
     raise "Failed to get kernel version: #{output[:stderr]}" unless output[:success]
     output[:stdout].strip
   end
@@ -312,7 +314,7 @@ module HammerUpdater
     end
     # Check fstab
     cmd = "chroot #{deployment} /bin/mount -f -a"
-    output = run_command("/bin/bash", ["-c", cmd])
+    output = run_command("/bin/sh", ["-c", cmd])
     raise "Fstab sanity check failed: #{output[:stderr]}" unless output[:success]
   end
 
