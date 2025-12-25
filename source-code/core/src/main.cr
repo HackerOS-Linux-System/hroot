@@ -3,12 +3,10 @@ require "file_utils"
 require "time"
 require "json"
 require "digest/sha256"
-
 if LibC.getuid != 0
   puts "This tool must be run as root."
   exit(1)
 end
-
 CONTAINER_TOOL = "podman"
 CONTAINER_NAME_PREFIX = "hammer-container-"
 CONTAINER_IMAGE = "debian:stable"
@@ -17,25 +15,27 @@ DEPLOYMENTS_DIR = "/btrfs-root/deployments"
 CURRENT_SYMLINK = "/btrfs-root/current"
 LOCK_FILE = "/run/hammer.lock"
 TRANSACTION_MARKER = "/btrfs-root/hammer-transaction"
-
 def run_command(cmd : String, args : Array(String)) : {success: Bool, stdout: String, stderr: String}
   stdout = IO::Memory.new
   stderr = IO::Memory.new
   status = Process.run(cmd, args: args, output: stdout, error: stderr)
   {success: status.success?, stdout: stdout.to_s, stderr: stderr.to_s}
 end
-
+def run_as_user(user : String, cmd : String) : {success: Bool, stdout: String, stderr: String}
+  stdout = IO::Memory.new
+  stderr = IO::Memory.new
+  status = Process.run("su", args: ["-", user, "-c", cmd], output: stdout, error: stderr)
+  {success: status.success?, stdout: stdout.to_s, stderr: stderr.to_s}
+end
 def acquire_lock
   if File.exists?(LOCK_FILE)
     raise "Hammer operation in progress (lock file exists)."
   end
   File.touch(LOCK_FILE)
 end
-
 def release_lock
   File.delete(LOCK_FILE) if File.exists?(LOCK_FILE)
 end
-
 def validate_system
   # Check if root is BTRFS
   output = run_command("btrfs", ["filesystem", "show", "/"])
@@ -51,7 +51,6 @@ def validate_system
     raise "Current deployment is not read-only."
   end
 end
-
 def parse_install_remove(args : Array(String)) : {package: String, atomic: Bool, gui: Bool}
   atomic = false
   gui = false
@@ -79,7 +78,6 @@ def parse_install_remove(args : Array(String)) : {package: String, atomic: Bool,
   end
   {package: package, atomic: atomic, gui: gui}
 end
-
 def parse_switch(args : Array(String)) : String?
   deployment = nil
   parser = OptionParser.new do |p|
@@ -90,7 +88,6 @@ def parse_switch(args : Array(String)) : String?
   parser.parse(args)
   deployment
 end
-
 def parse_rollback(args : Array(String)) : Int32
   n = 1
   parser = OptionParser.new do |p|
@@ -101,7 +98,6 @@ def parse_rollback(args : Array(String)) : Int32
   parser.parse(args)
   n
 end
-
 def install_package(package : String, atomic : Bool, gui : Bool)
   puts "Installing package: #{package} (atomic: #{atomic}, gui: #{gui})"
   if atomic
@@ -110,7 +106,6 @@ def install_package(package : String, atomic : Bool, gui : Bool)
     container_install(package, gui)
   end
 end
-
 def remove_package(package : String, atomic : Bool, gui : Bool)
   puts "Removing package: #{package} (atomic: #{atomic}, gui: #{gui})"
   if atomic
@@ -119,64 +114,76 @@ def remove_package(package : String, atomic : Bool, gui : Bool)
     container_remove(package, gui)
   end
 end
-
 def container_install(package : String, gui : Bool)
-  container_name = CONTAINER_NAME_PREFIX + "default"
-  ensure_container_exists(container_name)
-  # Check if already installed
-  check_output = run_command(CONTAINER_TOOL, ["exec", container_name, "dpkg", "-s", package])
-  if check_output[:success]
-    puts "Package #{package} is already installed in the container."
-    return
-  end
-  update_output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "update"])
-  raise "Failed to update in container: #{update_output[:stderr]}" unless update_output[:success]
-  install_output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "install", "-y", package])
-  raise "Failed to install package in container: #{install_output[:stderr]}" unless install_output[:success]
-  puts "Package #{package} installed in container successfully."
-  # Create wrappers or .desktop files
   if gui
-    # Find .desktop files from the package
-    files_output = run_command(CONTAINER_TOOL, ["exec", container_name, "dpkg", "-L", package])
-    raise "Failed to list package files: #{files_output[:stderr]}" unless files_output[:success]
-    files = files_output[:stdout].lines.map(&.strip)
-    desktop_files = files.select { |f| f.ends_with?(".desktop") && f.starts_with?("/usr/share/applications/") }
-    desktop_files.each do |df|
-      content_output = run_command(CONTAINER_TOOL, ["exec", container_name, "cat", df])
-      if content_output[:success]
-        desktop_content = content_output[:stdout]
-        # Modify Exec= to prefix with sudo podman exec, including start check
-        new_content = desktop_content.lines.map do |line|
-          if line.starts_with?("Exec=")
-            exec_cmd = line[5..].strip
-            "Exec=sh -c \"sudo #{CONTAINER_TOOL} ps --filter name=^#{container_name}$ --filter status=running -q | grep -q . || sudo #{CONTAINER_TOOL} start #{container_name}; sudo #{CONTAINER_TOOL} exec #{container_name} #{exec_cmd}\""
-          else
-            line
-          end
-        end.join("\n") + "\n"
-        # Handle Icon if absolute path
-        icon = nil
-        desktop_content.lines.each do |line|
-          if line.starts_with?("Icon=")
-            icon = line[5..].strip
-            break
-          end
+    user = ENV["SUDO_USER"]? || begin
+      puts "This command with --gui must be run using sudo by a non-root user."
+      exit(1)
+    end
+    container_name = "hammer-gui"
+    # Ensure distrobox exists
+    check_container = run_as_user(user, "distrobox list | grep -q '#{container_name}'")
+    if !check_container[:success]
+      create_output = run_as_user(user, "distrobox create --name #{container_name} --image #{CONTAINER_IMAGE} --yes")
+      raise "Failed to create distrobox container: #{create_output[:stderr]}" unless create_output[:success]
+      puts "Created distrobox container: #{container_name}"
+    end
+    # Check if already installed
+    check_output = run_as_user(user, "distrobox enter #{container_name} -- dpkg -s #{package}")
+    if check_output[:success]
+      puts "Package #{package} is already installed in the distrobox."
+      return
+    end
+    # Setup sources and architecture
+    sources_setup = run_as_user(user, "distrobox enter #{container_name} -- sudo sed -i 's/main$/main contrib non-free non-free-firmware/g' /etc/apt/sources.list")
+    if !sources_setup[:success]
+      puts "Warning: Failed to setup sources: #{sources_setup[:stderr]}"
+    end
+    arch_setup = run_as_user(user, "distrobox enter #{container_name} -- sudo dpkg --add-architecture i386")
+    if !arch_setup[:success]
+      puts "Warning: Failed to add i386 architecture: #{arch_setup[:stderr]}"
+    end
+    # Update
+    update_output = run_as_user(user, "distrobox enter #{container_name} -- sudo apt update")
+    raise "Failed to update in distrobox: #{update_output[:stderr]}" unless update_output[:success]
+    # Install
+    install_output = run_as_user(user, "distrobox enter #{container_name} -- sudo apt install -y #{package}")
+    raise "Failed to install package in distrobox: #{install_output[:stderr]}" unless install_output[:success]
+    puts "Package #{package} installed in distrobox successfully."
+    # Find .desktop files and export
+    files_output = run_as_user(user, "distrobox enter #{container_name} -- dpkg -L #{package}")
+    if files_output[:success]
+      files = files_output[:stdout].lines.map(&.strip)
+      desktop_files = files.select { |f| f.ends_with?(".desktop") && f.starts_with?("/usr/share/applications/") }
+      app_names = desktop_files.map { |df| File.basename(df, ".desktop") }
+      app_names.each do |app|
+        export_output = run_as_user(user, "distrobox-export --name #{container_name} --app #{app}")
+        if export_output[:success]
+          puts "Exported app: #{app}"
+        else
+          puts "Warning: Failed to export app #{app}: #{export_output[:stderr]}"
         end
-        if icon && icon.starts_with?("/")
-          # Copy icon to host
-          host_icon_dir = File.dirname(icon)
-          Dir.mkdir_p(host_icon_dir)
-          copy_output = run_command(CONTAINER_TOOL, ["cp", "#{container_name}:#{icon}", icon])
-          puts "Warning: Failed to copy icon #{icon}: #{copy_output[:stderr]}" unless copy_output[:success]
-        end
-        # Write to host
-        host_df = "/usr/share/applications/#{File.basename(df)}"
-        File.write(host_df, new_content)
-        File.chmod(host_df, 0o644)
-        puts "Created .desktop file: #{host_df}"
       end
+      if app_names.empty?
+        puts "No .desktop files found for export. If this is a GUI app, check the package."
+      end
+    else
+      puts "Warning: Failed to list package files for export: #{files_output[:stderr]}"
     end
   else
+    container_name = CONTAINER_NAME_PREFIX + "default"
+    ensure_container_exists(container_name)
+    # Check if already installed
+    check_output = run_command(CONTAINER_TOOL, ["exec", container_name, "dpkg", "-s", package])
+    if check_output[:success]
+      puts "Package #{package} is already installed in the container."
+      return
+    end
+    update_output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "update"])
+    raise "Failed to update in container: #{update_output[:stderr]}" unless update_output[:success]
+    install_output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "install", "-y", package])
+    raise "Failed to install package in container: #{install_output[:stderr]}" unless install_output[:success]
+    puts "Package #{package} installed in container successfully."
     # Assume CLI, create wrapper in /usr/bin
     wrapper_path = "/usr/bin/#{package}"
     wrapper_content = <<-WRAPPER
@@ -187,45 +194,70 @@ WRAPPER
     File.write(wrapper_path, wrapper_content)
     File.chmod(wrapper_path, 0o755)
     puts "Created CLI wrapper: #{wrapper_path}"
+    puts "To run manually: sudo #{CONTAINER_TOOL} exec -it #{container_name} #{package}"
   end
-  puts "To run manually: sudo #{CONTAINER_TOOL} exec -it #{container_name} #{package}"
 end
-
 def container_remove(package : String, gui : Bool)
-  container_name = CONTAINER_NAME_PREFIX + "default"
-  ensure_container_exists(container_name)
-  # Check if installed
-  check_output = run_command(CONTAINER_TOOL, ["exec", container_name, "dpkg", "-s", package])
-  unless check_output[:success]
-    puts "Package #{package} is not installed in the container."
-    return
-  end
-  # Get files list before remove for GUI
-  files_output = {success: false, stdout: "", stderr: ""}
   if gui
-    files_output = run_command(CONTAINER_TOOL, ["exec", container_name, "dpkg", "-L", package])
-    raise "Failed to list package files: #{files_output[:stderr]}" unless files_output[:success]
-  end
-  remove_output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "remove", "-y", package])
-  raise "Failed to remove package from container: #{remove_output[:stderr]}" unless remove_output[:success]
-  puts "Package #{package} removed from container successfully."
-  # Remove wrappers or .desktop files
-  if gui
-    files = files_output[:stdout].lines.map(&.strip)
-    desktop_files = files.select { |f| f.ends_with?(".desktop") && f.starts_with?("/usr/share/applications/") }
-    desktop_files.each do |df|
-      host_df = "/usr/share/applications/#{File.basename(df)}"
-      File.delete(host_df) if File.exists?(host_df)
-      puts "Removed .desktop file: #{host_df}"
+    user = ENV["SUDO_USER"]? || begin
+      puts "This command with --gui must be run using sudo by a non-root user."
+      exit(1)
     end
+    container_name = "hammer-gui"
+    # Check if container exists
+    check_container = run_as_user(user, "distrobox list | grep -q '#{container_name}'")
+    if !check_container[:success]
+      puts "Package #{package} is not installed in the distrobox."
+      return
+    end
+    # Check if installed
+    check_output = run_as_user(user, "distrobox enter #{container_name} -- dpkg -s #{package}")
+    unless check_output[:success]
+      puts "Package #{package} is not installed in the distrobox."
+      return
+    end
+    # Get .desktop files before remove
+    files_output = run_as_user(user, "distrobox enter #{container_name} -- dpkg -L #{package}")
+    app_names = [] of String
+    if files_output[:success]
+      files = files_output[:stdout].lines.map(&.strip)
+      desktop_files = files.select { |f| f.ends_with?(".desktop") && f.starts_with?("/usr/share/applications/") }
+      app_names = desktop_files.map { |df| File.basename(df, ".desktop") }
+    else
+      puts "Warning: Failed to list package files for unexport: #{files_output[:stderr]}"
+    end
+    # Unexport apps
+    app_names.each do |app|
+      unexport_output = run_as_user(user, "distrobox-export --name #{container_name} --app #{app} --delete")
+      if unexport_output[:success]
+        puts "Unexported app: #{app}"
+      else
+        puts "Warning: Failed to unexport app #{app}: #{unexport_output[:stderr]}"
+      end
+    end
+    # Remove package
+    remove_output = run_as_user(user, "distrobox enter #{container_name} -- sudo apt remove -y #{package}")
+    raise "Failed to remove package from distrobox: #{remove_output[:stderr]}" unless remove_output[:success]
+    puts "Package #{package} removed from distrobox successfully."
   else
+    container_name = CONTAINER_NAME_PREFIX + "default"
+    ensure_container_exists(container_name)
+    # Check if installed
+    check_output = run_command(CONTAINER_TOOL, ["exec", container_name, "dpkg", "-s", package])
+    unless check_output[:success]
+      puts "Package #{package} is not installed in the container."
+      return
+    end
+    # Get files list before remove for GUI, but since not gui, skip
+    remove_output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "remove", "-y", package])
+    raise "Failed to remove package from container: #{remove_output[:stderr]}" unless remove_output[:success]
+    puts "Package #{package} removed from container successfully."
     # Remove CLI wrapper
     wrapper_path = "/usr/bin/#{package}"
     File.delete(wrapper_path) if File.exists?(wrapper_path)
     puts "Removed CLI wrapper: #{wrapper_path}"
   end
 end
-
 def atomic_install(package : String, gui : Bool)
   new_deployment : String? = nil
   mounted = false
@@ -274,7 +306,6 @@ def atomic_install(package : String, gui : Bool)
     release_lock
   end
 end
-
 def atomic_remove(package : String, gui : Bool)
   new_deployment : String? = nil
   mounted = false
@@ -323,7 +354,6 @@ def atomic_remove(package : String, gui : Bool)
     release_lock
   end
 end
-
 def create_deployment(writable : Bool) : String
   puts "Creating new deployment..."
   Dir.mkdir_p(DEPLOYMENTS_DIR)
@@ -340,7 +370,6 @@ def create_deployment(writable : Bool) : String
   puts "Deployment created at: #{new_deployment}"
   new_deployment
 end
-
 def switch_deployment(deployment : String?)
   begin
     acquire_lock
@@ -362,7 +391,6 @@ def switch_deployment(deployment : String?)
     release_lock
   end
 end
-
 def switch_to_deployment(deployment : String)
   id = get_subvol_id(deployment)
   output = run_command("btrfs", ["subvolume", "set-default", id, "/"])
@@ -370,7 +398,6 @@ def switch_to_deployment(deployment : String)
   File.delete(CURRENT_SYMLINK) if File.exists?(CURRENT_SYMLINK)
   File.symlink(deployment, CURRENT_SYMLINK)
 end
-
 def clean_up
   begin
     acquire_lock
@@ -389,7 +416,6 @@ def clean_up
     release_lock
   end
 end
-
 def refresh
   begin
     acquire_lock
@@ -404,7 +430,6 @@ def refresh
     release_lock
   end
 end
-
 def ensure_container_exists(container_name : String)
   exists_output = run_command(CONTAINER_TOOL, ["container", "exists", container_name])
   newly_created = false
@@ -439,13 +464,11 @@ SUDOERS
     raise "Failed to start container: #{start_output[:stderr]}" unless start_output[:success]
   end
 end
-
 def get_deployments : Array(String)
   Dir.entries(DEPLOYMENTS_DIR).select(&.starts_with?("hammer-")).map { |f| File.join(DEPLOYMENTS_DIR, f) }
 rescue ex : Exception
   raise "Failed to list deployments: #{ex.message}"
 end
-
 def get_subvol_id(path : String) : String
   output = run_command("btrfs", ["subvolume", "show", path])
   raise "Failed to get subvolume ID." unless output[:success]
@@ -457,13 +480,11 @@ def get_subvol_id(path : String) : String
   end
   raise "Subvolume ID not found."
 end
-
 def set_subvolume_readonly(path : String, readonly : Bool)
   value = readonly ? "true" : "false"
   output = run_command("btrfs", ["property", "set", "-ts", path, "ro", value])
   raise "Failed to set readonly #{value}: #{output[:stderr]}" unless output[:success]
 end
-
 def bind_mounts_for_chroot(chroot_path : String, mount : Bool)
   dirs = ["proc", "sys", "dev"]
   dirs.each do |dir|
@@ -477,14 +498,12 @@ def bind_mounts_for_chroot(chroot_path : String, mount : Bool)
     raise "Failed to #{mount ? "mount" : "umount"} #{dir}: #{output[:stderr]}" unless output[:success]
   end
 end
-
 def get_kernel_version(chroot_path : String) : String
   cmd = "chroot #{chroot_path} /bin/sh -c \"dpkg -l | grep ^ii | grep linux-image | awk '{print \\$3}' | sort -V | tail -1\""
   output = run_command("/bin/sh", ["-c", cmd])
   raise "Failed to get kernel version: #{output[:stderr]}" unless output[:success]
   output[:stdout].strip
 end
-
 def write_meta(deployment : String, action : String, parent : String, kernel : String, system_version : String, status : String = "ready", rollback_reason : String? = nil)
   meta = {
     "created" => Time.utc.to_rfc3339,
@@ -497,7 +516,6 @@ def write_meta(deployment : String, action : String, parent : String, kernel : S
   }.reject { |k, v| v.nil? }
   File.write("#{deployment}/meta.json", meta.to_json)
 end
-
 def read_meta(deployment : String) : Hash(String, String)
   meta_path = "#{deployment}/meta.json"
   if File.exists?(meta_path)
@@ -506,21 +524,17 @@ def read_meta(deployment : String) : Hash(String, String)
     {} of String => String
   end
 end
-
 def update_meta(deployment : String, **updates)
   meta = read_meta(deployment)
   updates.each { |k, v| meta[k.to_s] = v.to_s if v }
   File.write("#{deployment}/meta.json", meta.to_json)
 end
-
 def set_status_broken(deployment : String)
   update_meta(deployment, status: "broken")
 end
-
 def set_status_booted(deployment : String)
   update_meta(deployment, status: "booted")
 end
-
 def hammer_status
   validate_system
   current = File.readlink(CURRENT_SYMLINK)
@@ -534,7 +548,6 @@ def hammer_status
   puts "Status: #{meta["status"]? || "N/A"}"
   puts "Rollback Reason: #{meta["rollback_reason"]? || "N/A"}"
 end
-
 def hammer_history
   validate_system
   deployments = get_deployments
@@ -550,7 +563,6 @@ def hammer_history
     puts "#{index}: #{item[:name]}#{mark} | Created: #{item[:meta]["created"]?} | Action: #{item[:meta]["action"]?} | Parent: #{item[:meta]["parent"]?} | Kernel: #{item[:meta]["kernel"]?} | Version: #{item[:meta]["system_version"]?} | Status: #{item[:meta]["status"]?} | Rollback: #{item[:meta]["rollback_reason"]?}"
   end
 end
-
 def hammer_rollback(n : Int32)
   begin
     acquire_lock
@@ -572,16 +584,13 @@ def hammer_rollback(n : Int32)
     release_lock
   end
 end
-
 def create_transaction_marker(deployment : String)
   data = {"deployment" => File.basename(deployment)}
   File.write(TRANSACTION_MARKER, data.to_json)
 end
-
 def remove_transaction_marker
   File.delete(TRANSACTION_MARKER) if File.exists?(TRANSACTION_MARKER)
 end
-
 def hammer_check_transaction
   if File.exists?(TRANSACTION_MARKER)
     data = JSON.parse(File.read(TRANSACTION_MARKER))
@@ -596,7 +605,6 @@ def hammer_check_transaction
     end
   end
 end
-
 def sanity_check(deployment : String, kernel : String)
   unless File.exists?("#{deployment}/boot/vmlinuz-#{kernel}")
     raise "Kernel file missing: /boot/vmlinuz-#{kernel}"
@@ -609,7 +617,6 @@ def sanity_check(deployment : String, kernel : String)
   output = run_command("/bin/sh", ["-c", cmd])
   raise "Fstab sanity check failed: #{output[:stderr]}" unless output[:success]
 end
-
 def compute_system_version(deployment : String) : String
   packages_file = "#{deployment}/tmp/packages.list"
   if File.exists?(packages_file)
@@ -621,7 +628,6 @@ def compute_system_version(deployment : String) : String
     raise "Packages list not found for version computation"
   end
 end
-
 def get_fs_uuid : String
   output = run_command("btrfs", ["filesystem", "show", "/"])
   raise "Failed to get BTRFS UUID: #{output[:stderr]}" unless output[:success]
@@ -632,7 +638,6 @@ def get_fs_uuid : String
   end
   raise "BTRFS UUID not found"
 end
-
 def update_bootloader_entries(deployment : String)
   good_deployments = get_deployments.select do |dep|
     meta = read_meta(dep)
@@ -670,7 +675,6 @@ SCRIPT
   File.write(grub_file, script_content)
   File.chmod(grub_file, 0o755)
 end
-
 if ARGV.empty?
   puts "No subcommand was used"
 else
