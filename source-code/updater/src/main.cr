@@ -166,6 +166,12 @@ module HammerUpdater
     update_system
   end
 
+  private def self.create_temp_dir(prefix : String) : String
+    output = run_command("mktemp", ["-d", "--tmpdir", "#{prefix}.XXXXXX"])
+    raise "Failed to create temp dir: #{output[:stderr]}" unless output[:success]
+    output[:stdout].strip
+  end
+
   private def self.initialize_system
     new_deployment : String? = nil
     temp_chroot : String? = nil
@@ -197,7 +203,7 @@ module HammerUpdater
       snapshot_recursive(current_path, new_deployment, true)
       device = get_root_device
       new_subvol = get_subvol_name(new_deployment)
-      temp_chroot = FileUtils.mktmpdir("hammer")
+      temp_chroot = create_temp_dir("hammer")
       mount_output = run_command("mount", ["-o", "subvol=#{new_subvol}", device, temp_chroot])
       raise "Failed to mount temp_chroot: #{mount_output[:stderr]}" unless mount_output[:success]
       temp_mounted = true
@@ -236,7 +242,7 @@ module HammerUpdater
         run_command("umount", [temp_chroot]) rescue nil
       end
       if temp_chroot && Dir.exists?(temp_chroot)
-        Dir.rmdir(temp_chroot) rescue nil
+        FileUtils.rm_rf(temp_chroot) rescue nil
       end
       release_lock
     end
@@ -264,7 +270,7 @@ module HammerUpdater
       create_transaction_marker(new_deployment)
       device = get_root_device
       new_subvol = get_subvol_name(new_deployment)
-      temp_chroot = FileUtils.mktmpdir("hammer")
+      temp_chroot = create_temp_dir("hammer")
       mount_output = run_command("mount", ["-o", "subvol=#{new_subvol}", device, temp_chroot])
       raise "Failed to mount temp_chroot: #{mount_output[:stderr]}" unless mount_output[:success]
       temp_mounted = true
@@ -304,7 +310,7 @@ module HammerUpdater
         run_command("umount", [temp_chroot]) rescue nil
       end
       if temp_chroot && Dir.exists?(temp_chroot)
-        Dir.rmdir(temp_chroot) rescue nil
+        FileUtils.rm_rf(temp_chroot) rescue nil
       end
       release_lock
     end
