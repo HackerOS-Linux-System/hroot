@@ -1,0 +1,15 @@
+#include <tunables/global>
+
+/usr/bin/dpkg flags=(attach_disconnected) {
+
+  capability sys_admin,
+  capability dac_override,
+
+  deny @{PROC}/** rwklx,
+  deny /usr/bin/** ix,
+
+  /usr/bin/dpkg mr,
+  /usr/lib/** rix,
+  /lib/** rix,
+  /usr/share/** r,
+}
