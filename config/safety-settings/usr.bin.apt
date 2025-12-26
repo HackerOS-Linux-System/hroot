@@ -1,0 +1,19 @@
+#include <tunables/global>
+
+/usr/bin/apt flags=(attach_disconnected) {
+
+  # pozwól rootowi
+  capability sys_admin,
+  capability dac_override,
+
+  # jeśli EUID != 0 → deny
+  deny @{PROC}/** rwklx,
+  deny /usr/bin/** ix,
+
+  # minimalne allow dla root
+  /usr/bin/apt mr,
+  /usr/lib/** rix,
+  /lib/** rix,
+  /usr/share/** r,
+
+}
