@@ -1,0 +1,24 @@
+#include <tunables/global>
+
+/usr/bin/hammer flags=(complain) {
+
+  capability sys_admin,
+  capability dac_override,
+  capability setuid,
+  capability setgid,
+
+  # może wywoływać apt i dpkg
+  /usr/bin/apt ix,
+  /usr/bin/apt-get ix,
+  /usr/bin/dpkg ix,
+
+  # biblioteki
+  /lib/** rix,
+  /usr/lib/** rix,
+
+  # configi
+  /etc/apt/** rw,
+  /var/lib/apt/** rw,
+  /var/lib/dpkg/** rw,
+
+}
