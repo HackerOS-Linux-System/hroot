@@ -5,7 +5,7 @@ require "json"
 require "digest/sha256"
 
 module HammerUpdater
-  VERSION = "0.8" # Updated version
+  VERSION = "0.6" # Updated version
   DEPLOYMENTS_DIR = "/btrfs-root/deployments"
   CURRENT_SYMLINK = "/btrfs-root/current"
   LOCK_FILE = "/run/hammer.lock"
@@ -276,7 +276,7 @@ module HammerUpdater
       temp_mounted = true
       bind_mounts_for_chroot(temp_chroot, true)
       chroot_mounted = true
-      chroot_cmd = "chroot #{temp_chroot} /bin/sh -c 'apt update && apt-mark manual plymouth && apt upgrade -y -o Dpkg::Options::=\\\"--force-confold\\\" && apt autoremove -y && dpkg -l > /tmp/packages.list && update-initramfs -u -k all && chmod -x /etc/grub.d/10_linux /etc/grub.d/20_linux_xen /etc/grub.d/30_os-prober'"
+      chroot_cmd = "chroot #{temp_chroot} /bin/sh -c 'apt update && apt-mark manual plymouth && apt upgrade -y -o Dpkg::Options::=--force-confold && apt autoremove -y && dpkg -l > /tmp/packages.list && update-initramfs -u -k all && chmod -x /etc/grub.d/10_linux /etc/grub.d/20_linux_xen /etc/grub.d/30_os-prober'"
       output = run_command("/bin/sh", ["-c", chroot_cmd])
       if !output[:success]
         raise "Failed to update in chroot: #{output[:stderr]}"
