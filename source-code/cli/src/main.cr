@@ -1,8 +1,14 @@
 require "option_parser"
+require "http/client"
+require "file_utils"
 
 module Hammer
-  VERSION = "0.7" # Updated version for expansions
+  VERSION = "0.8" # Updated version
   HAMMER_PATH = "/usr/lib/HackerOS/hammer/bin"
+  VERSION_FILE = "/usr/lib/hammer/version.hacker"
+  REMOTE_VERSION_URL = "https://raw.githubusercontent.com/HackerOS-Linux-System/hammer/main/config/version.hacker"
+  RELEASE_BASE_URL = "https://github.com/HackerOS-Linux-System/hammer/releases/download/v"
+
   # Color constants using ANSI escape codes (no external libraries)
   COLOR_RESET = "\033[0m"
   COLOR_RED = "\033[31m"
@@ -43,6 +49,12 @@ module Hammer
       history_command(ARGV)
     when "rollback"
       rollback_command(ARGV)
+    when "lock"
+      lock_command(ARGV)
+    when "unlock"
+      unlock_command(ARGV)
+    when "upgrade"
+      upgrade_command(ARGV)
     else
       usage
       exit(1)
@@ -208,6 +220,74 @@ module Hammer
     run_core("rollback", [n])
   end
 
+  private def self.lock_command(args : Array(String))
+    if args.size != 0
+      puts "#{COLOR_RED}Usage: hammer lock#{COLOR_RESET}"
+      exit(1)
+    end
+    run_core("lock", args)
+  end
+
+  private def self.unlock_command(args : Array(String))
+    if args.size != 0
+      puts "#{COLOR_RED}Usage: hammer unlock#{COLOR_RESET}"
+      exit(1)
+    end
+    run_core("unlock", args)
+  end
+
+  private def self.upgrade_command(args : Array(String))
+    if args.size != 0
+      puts "#{COLOR_RED}Usage: hammer upgrade#{COLOR_RESET}"
+      exit(1)
+    end
+    # Implement upgrade logic here
+    begin
+      # Read local version
+      local_version = if File.exists?(VERSION_FILE)
+                        File.read(VERSION_FILE).strip.gsub(/[\[\]]/, "").strip
+                      else
+                        "0.0"
+                      end
+
+      # Fetch remote version
+      response = HTTP::Client.get(REMOTE_VERSION_URL)
+      raise "Failed to fetch remote version" unless response.success?
+      remote_version = response.body.strip.gsub(/[\[\]]/, "").strip
+
+      if remote_version > local_version
+        puts "#{COLOR_GREEN}Upgrading from #{local_version} to #{remote_version}...#{COLOR_RESET}"
+
+        # Download new binaries
+        binaries = [
+          {"hammer", "/usr/bin/hammer"},
+          {"hammer-updater", "#{HAMMER_PATH}/hammer-updater"},
+          {"hammer-core", "#{HAMMER_PATH}/hammer-core"},
+          {"hammer-tui", "#{HAMMER_PATH}/hammer-tui"},
+          {"hammer-builder", "#{HAMMER_PATH}/hammer-builder"}
+        ]
+
+        binaries.each do |bin|
+          url = "#{RELEASE_BASE_URL}#{remote_version}/#{bin[0]}"
+          resp = HTTP::Client.get(url)
+          raise "Failed to download #{bin[0]}" unless resp.success?
+          File.write(bin[1], resp.body)
+          File.chmod(bin[1], 0o755)
+        end
+
+        # Update version file
+        File.write(VERSION_FILE, "[ #{remote_version} ]")
+
+        puts "#{COLOR_GREEN}Upgrade completed.#{COLOR_RESET}"
+      else
+        puts "#{COLOR_YELLOW}Already up to date (version #{local_version}).#{COLOR_RESET}"
+      end
+    rescue ex
+      puts "#{COLOR_RED}Error during upgrade: #{ex.message}#{COLOR_RESET}"
+      exit(1)
+    end
+  end
+
   private def self.run_core(subcommand : String, args : Array(String))
     binary = "#{HAMMER_PATH}/hammer-core"
     Process.run(binary, [subcommand] + args, output: Process::Redirect::Inherit, error: Process::Redirect::Inherit)
@@ -258,6 +338,9 @@ module Hammer
     puts " #{COLOR_YELLOW}status#{COLOR_RESET} Show current deployment status"
     puts " #{COLOR_YELLOW}history#{COLOR_RESET} Show deployment history"
     puts " #{COLOR_YELLOW}rollback [n]#{COLOR_RESET} Rollback n steps (default 1)"
+    puts " #{COLOR_YELLOW}lock#{COLOR_RESET} Lock the system (make readonly except /home /var)"
+    puts " #{COLOR_YELLOW}unlock#{COLOR_RESET} Unlock the system"
+    puts " #{COLOR_YELLOW}upgrade#{COLOR_RESET} Upgrade the hammer tool"
   end
 end
 
