@@ -1,33 +1,28 @@
 require "option_parser"
 require "file_utils"
-require "process"
+require "time"
+require "json"
+require "digest/sha256"
 
 if LibC.getuid != 0
   puts "This tool must be run as root."
   exit(1)
 end
 
-COLOR_RESET = "\033[0m"
-COLOR_RED = "\033[31m"
-COLOR_GREEN = "\033[32m"
-COLOR_YELLOW = "\033[33m"
-COLOR_BLUE = "\033[34m"
-COLOR_BOLD = "\033[1m"
-
-HAMMER_PATH = "/usr/lib/HackerOS/hammer/bin"
-LOG_DIR = "/usr/lib/HackerOS/hammer/logs"
 CONTAINER_TOOL = "podman"
 CONTAINER_NAME_PREFIX = "hammer-container-"
 CONTAINER_IMAGE = "debian:stable"
-
 BINARY_MAP = {
   "golang" => "go",
 }
 
-def log_message(message : String)
+LOG_DIR = "/usr/lib/HackerOS/hammer/logs"
+LOG_FILE = "#{LOG_DIR}/hammer-containers.log"
+
+def log(message : String)
   Dir.mkdir_p(LOG_DIR)
-  File.open("#{LOG_DIR}/hammer-container.log", "a") do |f|
-    f.puts "[#{Time.local}] #{message}"
+  File.open(LOG_FILE, "a") do |f|
+    f.puts "#{Time.local.to_s("%Y-%m-%d %H:%M:%S")} - #{message}"
   end
 end
 
@@ -38,101 +33,151 @@ def run_command(cmd : String, args : Array(String)) : {success: Bool, stdout: St
   {success: status.success?, stdout: stdout.to_s, stderr: stderr.to_s}
 end
 
-def start_progress(total_steps : Int32) : Process
-  progress_bin = "#{HAMMER_PATH}/hammer-progress-bar"
-  process = Process.new(progress_bin, input: Process::Redirect::Pipe, output: Process::Redirect::Pipe, error: Process::Redirect::Pipe)
-  sleep(0.1.seconds)
-  if !process.exists?
-    raise "Failed to start hammer-progress-bar"
-  end
-  process.input.puts "set_total #{total_steps}"
-  process.input.flush
-  process
+def run_as_user(user : String, cmd : String) : {success: Bool, stdout: String, stderr: String}
+  stdout = IO::Memory.new
+  stderr = IO::Memory.new
+  status = Process.run("su", args: ["-", user, "-c", cmd], output: stdout, error: stderr)
+  {success: status.success?, stdout: stdout.to_s, stderr: stderr.to_s}
 end
 
-def update_progress(process : Process, msg : String)
-  process.input.puts "msg #{msg}"
-  process.input.puts "update"
-  process.input.flush
-end
-
-def finish_progress(process : Process, msg : String = "done")
-  process.input.puts "msg #{msg}"
-  process.input.puts "done"
-  process.input.flush
-  process.wait
-end
-
-def ensure_container_exists(container_name : String)
-  exists_output = run_command(CONTAINER_TOOL, ["container", "exists", container_name])
-  newly_created = false
-  if !exists_output[:success]
-    create_output = run_command(CONTAINER_TOOL, ["run", "-d", "--name", container_name, CONTAINER_IMAGE, "sleep", "infinity"])
-    if !create_output[:success]
-      log_message("Failed to create container: #{create_output[:stderr]}")
-      raise "Failed to create container: #{create_output[:stderr]}"
+def parse_install_remove(args : Array(String)) : {package: String, gui: Bool}
+  gui = false
+  package = ""
+  parser = OptionParser.new do |p|
+    p.banner = "Usage: [subcommand] [options] package"
+    p.on("--gui", "Install as GUI application") { gui = true }
+    p.invalid_option do |flag|
+      STDERR.puts "Invalid option: #{flag}."
+      exit(1)
     end
-    newly_created = true
+    p.missing_option do |flag|
+      STDERR.puts "Missing option for #{flag}."
+      exit(1)
+    end
+    p.unknown_args do |uargs|
+      package = uargs[0] if uargs.size > 0
+    end
   end
-  if newly_created
-    sed_args = ["exec", container_name, "sed", "-i", "s/main$/main contrib non-free non-free-firmware/g", "/etc/apt/sources.list"]
-    setup_output = run_command(CONTAINER_TOOL, sed_args)
-    unless setup_output[:success]
-      log_message("Warning: Failed to setup apt sources: #{setup_output[:stderr]}")
-      puts "#{COLOR_YELLOW}Warning: Failed to setup apt sources: #{setup_output[:stderr]}#{COLOR_RESET}"
+  parser.parse(args)
+  if package.empty?
+    STDERR.puts "Package name required."
+    exit(1)
+  end
+  {package: package, gui: gui}
+end
+
+def install_package(package : String, gui : Bool)
+  log("Installing package: #{package} (gui: #{gui})")
+  puts "Installing package: #{package} (gui: #{gui})"
+  container_install(package, gui)
+end
+
+def remove_package(package : String, gui : Bool)
+  log("Removing package: #{package} (gui: #{gui})")
+  puts "Removing package: #{package} (gui: #{gui})"
+  container_remove(package, gui)
+end
+
+def container_install(package : String, gui : Bool)
+  if gui
+    user = ENV["SUDO_USER"]? || begin
+      puts "This command with --gui must be run using sudo by a non-root user."
+      log("Error: --gui requires sudo by non-root user")
+      exit(1)
+    end
+    container_name = "hammer-gui"
+    # Ensure distrobox exists
+    check_container = run_as_user(user, "distrobox list | grep -q '#{container_name}'")
+    if !check_container[:success]
+      create_output = run_as_user(user, "distrobox create --name #{container_name} --image #{CONTAINER_IMAGE} --yes")
+      unless create_output[:success]
+        log("Failed to create distrobox container: #{create_output[:stderr]}")
+        raise "Failed to create distrobox container: #{create_output[:stderr]}"
+      end
+      log("Created distrobox container: #{container_name}")
+      puts "Created distrobox container: #{container_name}"
+    end
+    # Check if already installed
+    check_output = run_as_user(user, "distrobox enter #{container_name} -- dpkg -s #{package}")
+    if check_output[:success]
+      log("Package #{package} already installed in distrobox")
+      puts "Package #{package} is already installed in the distrobox."
+      return
+    end
+    # Setup sources and architecture
+    sources_setup_cmd = "sudo bash -c 'if [ ! -f /etc/apt/sources.list ]; then echo \\\"deb http://deb.debian.org/debian stable main contrib non-free non-free-firmware\\\" > /etc/apt/sources.list; else sed -i \\\"s/main$/main contrib non-free non-free-firmware/g\\\" /etc/apt/sources.list; fi'"
+    sources_setup = run_as_user(user, "distrobox enter #{container_name} -- #{sources_setup_cmd}")
+    if !sources_setup[:success]
+      log("Warning: Failed to setup sources: #{sources_setup[:stderr]}")
+      puts "Warning: Failed to setup sources: #{sources_setup[:stderr]}"
+    end
+    arch_setup = run_as_user(user, "distrobox enter #{container_name} -- sudo dpkg --add-architecture i386")
+    if !arch_setup[:success]
+      log("Warning: Failed to add i386 architecture: #{arch_setup[:stderr]}")
+      puts "Warning: Failed to add i386 architecture: #{arch_setup[:stderr]}"
+    end
+    # Update
+    update_output = run_as_user(user, "distrobox enter #{container_name} -- sudo apt update")
+    unless update_output[:success]
+      log("Failed to update in distrobox: #{update_output[:stderr]}")
+      raise "Failed to update in distrobox: #{update_output[:stderr]}"
+    end
+    # Install
+    install_output = run_as_user(user, "distrobox enter #{container_name} -- sudo apt install -y #{package}")
+    unless install_output[:success]
+      log("Failed to install package in distrobox: #{install_output[:stderr]}")
+      raise "Failed to install package in distrobox: #{install_output[:stderr]}"
+    end
+    log("Package #{package} installed in distrobox successfully")
+    puts "Package #{package} installed in distrobox successfully."
+    # Find .desktop files and export
+    files_output = run_as_user(user, "distrobox enter #{container_name} -- dpkg -L #{package}")
+    if files_output[:success]
+      files = files_output[:stdout].lines.map(&.strip)
+      desktop_files = files.select { |f| f.ends_with?(".desktop") && f.starts_with?("/usr/share/applications/") }
+      app_names = desktop_files.map { |df| File.basename(df, ".desktop") }
+      app_names.each do |app|
+        export_output = run_as_user(user, "distrobox enter #{container_name} -- distrobox-export --app #{app}")
+        if export_output[:success]
+          log("Exported app: #{app}")
+          puts "Exported app: #{app}"
+        else
+          log("Warning: Failed to export app #{app}: #{export_output[:stderr]}")
+          puts "Warning: Failed to export app #{app}: #{export_output[:stderr]}"
+        end
+      end
+      if app_names.empty?
+        log("No .desktop files found for export")
+        puts "No .desktop files found for export. If this is a GUI app, check the package."
+      end
+    else
+      log("Warning: Failed to list package files for export: #{files_output[:stderr]}")
+      puts "Warning: Failed to list package files for export: #{files_output[:stderr]}"
+    end
+  else
+    binary = BINARY_MAP[package]? || package
+    container_name = CONTAINER_NAME_PREFIX + "default"
+    ensure_container_exists(container_name)
+    # Check if already installed
+    check_output = run_command(CONTAINER_TOOL, ["exec", container_name, "dpkg", "-s", package])
+    if check_output[:success]
+      log("Package #{package} already installed in container")
+      puts "Package #{package} is already installed in the container."
+      return
     end
     update_output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "update"])
     unless update_output[:success]
-      log_message("Failed to initial apt update in container: #{update_output[:stderr]}")
-      raise "Failed to initial apt update in container: #{update_output[:stderr]}"
-    end
-    sudoers_path = "/etc/sudoers.d/hammer-podman"
-    sudoers_content = "%sudo ALL=(ALL) NOPASSWD: /usr/bin/podman start #{container_name}, /usr/bin/podman exec #{container_name} *, /usr/bin/podman ps --filter name=^#{container_name}$ --filter status=running -q\n"
-    File.write(sudoers_path, sudoers_content)
-    File.chmod(sudoers_path, 0o440)
-  end
-  running_output = run_command(CONTAINER_TOOL, ["ps", "-q", "-f", "name=^#{container_name}$"])
-  if running_output[:stdout].strip.empty?
-    start_output = run_command(CONTAINER_TOOL, ["start", container_name])
-    if !start_output[:success]
-      log_message("Failed to start container: #{start_output[:stderr]}")
-      raise "Failed to start container: #{start_output[:stderr]}"
-    end
-  end
-end
-
-def container_install(package : String)
-  progress : Process? = nil
-  time_start = Time.monotonic
-  begin
-    log_message("Starting container install of #{package}")
-    puts "#{COLOR_BLUE}Installing #{package} in container...#{COLOR_RESET}"
-    progress = start_progress(5)
-    binary = BINARY_MAP[package]? || package
-    container_name = CONTAINER_NAME_PREFIX + "default"
-    update_progress(progress, "Ensuring container exists")
-    ensure_container_exists(container_name)
-    update_progress(progress, "Checking if installed")
-    check_output = run_command(CONTAINER_TOOL, ["exec", container_name, "dpkg", "-s", package])
-    if check_output[:success]
-      puts "#{COLOR_YELLOW}Package #{package} is already installed in the container.#{COLOR_RESET}"
-      finish_progress(progress, "Already installed")
-      return
-    end
-    update_progress(progress, "Updating apt")
-    update_output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "update"])
-    if !update_output[:success]
-      log_message("Failed to update in container: #{update_output[:stderr]}")
+      log("Failed to update in container: #{update_output[:stderr]}")
       raise "Failed to update in container: #{update_output[:stderr]}"
     end
-    update_progress(progress, "Installing package")
     install_output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "install", "-y", package])
-    if !install_output[:success]
-      log_message("Failed to install package in container: #{install_output[:stderr]}")
+    unless install_output[:success]
+      log("Failed to install package in container: #{install_output[:stderr]}")
       raise "Failed to install package in container: #{install_output[:stderr]}"
     end
-    puts "#{COLOR_GREEN}Package #{package} installed in container successfully.#{COLOR_RESET}"
-    update_progress(progress, "Creating wrapper")
+    log("Package #{package} installed in container successfully")
+    puts "Package #{package} installed in container successfully."
+    # Assume CLI, create wrapper in /usr/bin
     wrapper_path = "/usr/bin/#{binary}"
     wrapper_content = <<-WRAPPER
 #!/bin/sh
@@ -141,83 +186,190 @@ sudo #{CONTAINER_TOOL} exec #{container_name} #{binary} "$@"
 WRAPPER
     File.write(wrapper_path, wrapper_content)
     File.chmod(wrapper_path, 0o755)
+    log("Created CLI wrapper: #{wrapper_path}")
     puts "Created CLI wrapper: #{wrapper_path}"
     puts "To run manually: sudo #{CONTAINER_TOOL} exec -it #{container_name} #{binary}"
-    finish_progress(progress, "Completed")
-  rescue ex : Exception
-    log_message("Error in container install: #{ex.message}")
-    puts "#{COLOR_RED}Error: #{ex.message}#{COLOR_RESET}"
-    if progress
-      finish_progress(progress, "Error: #{ex.message}")
-    end
-    exit(1)
-  ensure
-    duration = Time.monotonic - time_start
-    log_message("Container install completed, duration: #{duration.total_seconds} seconds")
   end
 end
 
-def container_remove(package : String)
-  progress : Process? = nil
-  time_start = Time.monotonic
-  begin
-    log_message("Starting container remove of #{package}")
-    puts "#{COLOR_BLUE}Removing #{package} from container...#{COLOR_RESET}"
-    progress = start_progress(4)
-    binary = BINARY_MAP[package]? || package
-    container_name = CONTAINER_NAME_PREFIX + "default"
-    update_progress(progress, "Ensuring container exists")
-    ensure_container_exists(container_name)
-    update_progress(progress, "Checking if installed")
-    check_output = run_command(CONTAINER_TOOL, ["exec", container_name, "dpkg", "-s", package])
-    unless check_output[:success]
-      puts "#{COLOR_YELLOW}Package #{package} is not installed in the container.#{COLOR_RESET}"
-      finish_progress(progress, "Not installed")
+def container_remove(package : String, gui : Bool)
+  if gui
+    user = ENV["SUDO_USER"]? || begin
+      puts "This command with --gui must be run using sudo by a non-root user."
+      log("Error: --gui requires sudo by non-root user")
+      exit(1)
+    end
+    container_name = "hammer-gui"
+    # Check if container exists
+    check_container = run_as_user(user, "distrobox list | grep -q '#{container_name}'")
+    if !check_container[:success]
+      log("Distrobox container #{container_name} does not exist")
+      puts "Package #{package} is not installed in the distrobox."
       return
     end
-    update_progress(progress, "Removing package")
+    # Check if installed
+    check_output = run_as_user(user, "distrobox enter #{container_name} -- dpkg -s #{package}")
+    unless check_output[:success]
+      log("Package #{package} not installed in distrobox")
+      puts "Package #{package} is not installed in the distrobox."
+      return
+    end
+    # Get .desktop files before remove
+    files_output = run_as_user(user, "distrobox enter #{container_name} -- dpkg -L #{package}")
+    app_names = [] of String
+    if files_output[:success]
+      files = files_output[:stdout].lines.map(&.strip)
+      desktop_files = files.select { |f| f.ends_with?(".desktop") && f.starts_with?("/usr/share/applications/") }
+      app_names = desktop_files.map { |df| File.basename(df, ".desktop") }
+    else
+      log("Warning: Failed to list package files for unexport: #{files_output[:stderr]}")
+      puts "Warning: Failed to list package files for unexport: #{files_output[:stderr]}"
+    end
+    # Unexport apps
+    app_names.each do |app|
+      unexport_output = run_as_user(user, "distrobox enter #{container_name} -- distrobox-export --app #{app} --delete")
+      if unexport_output[:success]
+        log("Unexported app: #{app}")
+        puts "Unexported app: #{app}"
+      else
+        log("Warning: Failed to unexport app #{app}: #{unexport_output[:stderr]}")
+        puts "Warning: Failed to unexport app #{app}: #{unexport_output[:stderr]}"
+      end
+    end
+    # Remove package
+    remove_output = run_as_user(user, "distrobox enter #{container_name} -- sudo apt remove -y #{package}")
+    unless remove_output[:success]
+      log("Failed to remove package from distrobox: #{remove_output[:stderr]}")
+      raise "Failed to remove package from distrobox: #{remove_output[:stderr]}"
+    end
+    log("Package #{package} removed from distrobox successfully")
+    puts "Package #{package} removed from distrobox successfully."
+  else
+    binary = BINARY_MAP[package]? || package
+    container_name = CONTAINER_NAME_PREFIX + "default"
+    ensure_container_exists(container_name)
+    # Check if installed
+    check_output = run_command(CONTAINER_TOOL, ["exec", container_name, "dpkg", "-s", package])
+    unless check_output[:success]
+      log("Package #{package} not installed in container")
+      puts "Package #{package} is not installed in the container."
+      return
+    end
+    # Remove package
     remove_output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "remove", "-y", package])
-    if !remove_output[:success]
-      log_message("Failed to remove package from container: #{remove_output[:stderr]}")
+    unless remove_output[:success]
+      log("Failed to remove package from container: #{remove_output[:stderr]}")
       raise "Failed to remove package from container: #{remove_output[:stderr]}"
     end
-    puts "#{COLOR_GREEN}Package #{package} removed from container successfully.#{COLOR_RESET}"
-    update_progress(progress, "Removing wrapper")
+    log("Package #{package} removed from container successfully")
+    puts "Package #{package} removed from container successfully."
+    # Remove CLI wrapper
     wrapper_path = "/usr/bin/#{binary}"
-    File.delete(wrapper_path) if File.exists?(wrapper_path)
-    puts "Removed CLI wrapper: #{wrapper_path}"
-    finish_progress(progress, "Completed")
-  rescue ex : Exception
-    log_message("Error in container remove: #{ex.message}")
-    puts "#{COLOR_RED}Error: #{ex.message}#{COLOR_RESET}"
-    if progress
-      finish_progress(progress, "Error: #{ex.message}")
+    if File.exists?(wrapper_path)
+      File.delete(wrapper_path)
+      log("Removed CLI wrapper: #{wrapper_path}")
+      puts "Removed CLI wrapper: #{wrapper_path}"
     end
-    exit(1)
-  ensure
-    duration = Time.monotonic - time_start
-    log_message("Container remove completed, duration: #{duration.total_seconds} seconds")
+  end
+end
+
+def ensure_container_exists(container_name : String)
+  log("Ensuring container #{container_name} exists")
+  exists_output = run_command(CONTAINER_TOOL, ["container", "exists", container_name])
+  newly_created = false
+  if !exists_output[:success]
+    create_output = run_command(CONTAINER_TOOL, ["run", "-d", "--name", container_name, CONTAINER_IMAGE, "sleep", "infinity"])
+    unless create_output[:success]
+      log("Failed to create container: #{create_output[:stderr]}")
+      raise "Failed to create container: #{create_output[:stderr]}"
+    end
+    newly_created = true
+    log("Created container: #{container_name}")
+  end
+  # Setup apt sources if newly created
+  if newly_created
+    sed_args = ["exec", container_name, "sed", "-i", "s/main$/main contrib non-free non-free-firmware/g", "/etc/apt/sources.list"]
+    setup_output = run_command(CONTAINER_TOOL, sed_args)
+    unless setup_output[:success]
+      log("Warning: Failed to setup apt sources: #{setup_output[:stderr]}")
+      puts "Warning: Failed to setup apt sources: #{setup_output[:stderr]}"
+    end
+    update_output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "update"])
+    unless update_output[:success]
+      log("Failed to initial apt update in container: #{update_output[:stderr]}")
+      raise "Failed to initial apt update in container: #{update_output[:stderr]}"
+    end
+    # Set up sudoers for podman commands
+    sudoers_path = "/etc/sudoers.d/hammer-podman"
+    sudoers_content = <<-SUDOERS
+%sudo ALL=(ALL) NOPASSWD: /usr/bin/podman start #{container_name}, /usr/bin/podman exec #{container_name} *, /usr/bin/podman ps --filter name=^#{container_name}$ --filter status=running -q
+SUDOERS
+    File.write(sudoers_path, sudoers_content)
+    File.chmod(sudoers_path, 0o440)
+    log("Set up sudoers for #{container_name}")
+  end
+  # Check if running
+  running_output = run_command(CONTAINER_TOOL, ["ps", "-q", "-f", "name=^#{container_name}$"])
+  if running_output[:stdout].strip.empty?
+    start_output = run_command(CONTAINER_TOOL, ["start", container_name])
+    unless start_output[:success]
+      log("Failed to start container: #{start_output[:stderr]}")
+      raise "Failed to start container: #{start_output[:stderr]}"
+    end
+    log("Started container: #{container_name}")
+  end
+end
+
+def clean_up
+  log("Cleaning up unused resources")
+  puts "Cleaning up unused resources..."
+  output = run_command(CONTAINER_TOOL, ["system", "prune", "-f"])
+  if output[:success]
+    log("Clean up completed: #{output[:stdout]}")
+    puts "Clean up completed."
+  else
+    log("Failed to clean up: #{output[:stderr]}")
+    STDERR.puts "Failed to clean up: #{output[:stderr]}"
+  end
+end
+
+def refresh
+  log("Refreshing container metadata")
+  puts "Refreshing container metadata..."
+  container_name = CONTAINER_NAME_PREFIX + "default"
+  ensure_container_exists(container_name)
+  output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "update"])
+  if output[:success]
+    log("Refresh completed")
+    puts "Refresh completed."
+  else
+    log("Failed to refresh: #{output[:stderr]}")
+    raise "Failed to refresh: #{output[:stderr]}"
   end
 end
 
 if ARGV.empty?
-  puts "Usage: hammer-container <install|remove> <package>"
-  exit(1)
-end
-
-subcommand = ARGV.shift
-package = ARGV.shift || ""
-if package.empty?
-  puts "Package name required."
-  exit(1)
-end
-
-case subcommand
-when "install"
-  container_install(package)
-when "remove"
-  container_remove(package)
+  puts "No subcommand was used"
 else
-  puts "Unknown subcommand: #{subcommand}"
-  exit(1)
+  subcommand = ARGV.shift
+  begin
+    case subcommand
+    when "install"
+      matches = parse_install_remove(ARGV)
+      install_package(matches[:package], matches[:gui])
+    when "remove"
+      matches = parse_install_remove(ARGV)
+      remove_package(matches[:package], matches[:gui])
+    when "refresh"
+      refresh
+    when "clean"
+      clean_up
+    else
+      puts "Unknown subcommand: #{subcommand}"
+    end
+  rescue ex : Exception
+    log("Error: #{ex.message}")
+    STDERR.puts "Error: #{ex.message}"
+    exit(1)
+  end
 end
