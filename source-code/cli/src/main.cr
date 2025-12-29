@@ -1,14 +1,12 @@
 require "option_parser"
 require "http/client"
 require "file_utils"
-
 module Hammer
   VERSION = "0.8" # Updated version
   HAMMER_PATH = "/usr/lib/HackerOS/hammer/bin"
   VERSION_FILE = "/usr/lib/hammer/version.hacker"
   REMOTE_VERSION_URL = "https://raw.githubusercontent.com/HackerOS-Linux-System/hammer/main/config/version.hacker"
   RELEASE_BASE_URL = "https://github.com/HackerOS-Linux-System/hammer/releases/download/v"
-
   # Color constants using ANSI escape codes (no external libraries)
   COLOR_RESET = "\033[0m"
   COLOR_RED = "\033[31m"
@@ -16,7 +14,6 @@ module Hammer
   COLOR_YELLOW = "\033[33m"
   COLOR_BLUE = "\033[34m"
   COLOR_BOLD = "\033[1m"
-
   def self.main
     return usage if ARGV.empty?
     command = ARGV.shift
@@ -60,7 +57,6 @@ module Hammer
       exit(1)
     end
   end
-
   private def self.install_command(args : Array(String))
     parser = OptionParser.new do |parser|
       parser.banner = "#{COLOR_BLUE}Usage: hammer install [options] <package>#{COLOR_RESET}"
@@ -84,7 +80,6 @@ module Hammer
     end
     run_core("install", atomic_flag + gui_flag + [package])
   end
-
   private def self.remove_command(args : Array(String))
     parser = OptionParser.new do |parser|
       parser.banner = "#{COLOR_BLUE}Usage: hammer remove [options] <package>#{COLOR_RESET}"
@@ -108,7 +103,6 @@ module Hammer
     end
     run_core("remove", atomic_flag + gui_flag + [package])
   end
-
   private def self.update_command(args : Array(String))
     if args.size != 0
       puts "#{COLOR_RED}Usage: hammer update#{COLOR_RESET}"
@@ -116,7 +110,6 @@ module Hammer
     end
     run_updater("update", args)
   end
-
   private def self.clean_command(args : Array(String))
     if args.size != 0
       puts "#{COLOR_RED}Usage: hammer clean#{COLOR_RESET}"
@@ -124,7 +117,6 @@ module Hammer
     end
     run_core("clean", args)
   end
-
   private def self.refresh_command(args : Array(String))
     if args.size != 0
       puts "#{COLOR_RED}Usage: hammer refresh#{COLOR_RESET}"
@@ -132,7 +124,6 @@ module Hammer
     end
     run_core("refresh", args)
   end
-
   private def self.build_command(args : Array(String))
     if args.size != 0
       puts "#{COLOR_RED}Usage: hammer build#{COLOR_RESET}"
@@ -140,7 +131,6 @@ module Hammer
     end
     run_builder("build", args)
   end
-
   private def self.switch_command(args : Array(String))
     parser = OptionParser.new do |parser|
       parser.banner = "#{COLOR_BLUE}Usage: hammer switch [deployment]#{COLOR_RESET}"
@@ -156,7 +146,6 @@ module Hammer
     run_args = deployment.empty? ? [] of String : [deployment]
     run_core("switch", run_args)
   end
-
   private def self.deploy_command(args : Array(String))
     if args.size != 0
       puts "#{COLOR_RED}Usage: hammer deploy#{COLOR_RESET}"
@@ -164,7 +153,6 @@ module Hammer
     end
     run_core("deploy", args)
   end
-
   private def self.build_init_command(args : Array(String))
     if args.size != 0
       puts "#{COLOR_RED}Usage: hammer build init#{COLOR_RESET}"
@@ -172,7 +160,6 @@ module Hammer
     end
     run_builder("init", args)
   end
-
   private def self.about_command(args : Array(String))
     if args.size != 0
       puts "#{COLOR_RED}Usage: hammer about#{COLOR_RESET}"
@@ -180,7 +167,6 @@ module Hammer
     end
     about
   end
-
   private def self.tui_command(args : Array(String))
     if args.size != 0
       puts "#{COLOR_RED}Usage: hammer tui#{COLOR_RESET}"
@@ -188,7 +174,6 @@ module Hammer
     end
     run_tui(args)
   end
-
   private def self.status_command(args : Array(String))
     if args.size != 0
       puts "#{COLOR_RED}Usage: hammer status#{COLOR_RESET}"
@@ -196,7 +181,6 @@ module Hammer
     end
     run_core("status", args)
   end
-
   private def self.history_command(args : Array(String))
     if args.size != 0
       puts "#{COLOR_RED}Usage: hammer history#{COLOR_RESET}"
@@ -204,7 +188,6 @@ module Hammer
     end
     run_core("history", args)
   end
-
   private def self.rollback_command(args : Array(String))
     parser = OptionParser.new do |parser|
       parser.banner = "#{COLOR_BLUE}Usage: hammer rollback [n]#{COLOR_RESET}"
@@ -219,7 +202,6 @@ module Hammer
     n = args[0]? ? args[0] : "1"
     run_core("rollback", [n])
   end
-
   private def self.lock_command(args : Array(String))
     if args.size != 0
       puts "#{COLOR_RED}Usage: hammer lock#{COLOR_RESET}"
@@ -227,7 +209,6 @@ module Hammer
     end
     run_core("lock", args)
   end
-
   private def self.unlock_command(args : Array(String))
     if args.size != 0
       puts "#{COLOR_RED}Usage: hammer unlock#{COLOR_RESET}"
@@ -235,7 +216,6 @@ module Hammer
     end
     run_core("unlock", args)
   end
-
   private def self.upgrade_command(args : Array(String))
     if args.size != 0
       puts "#{COLOR_RED}Usage: hammer upgrade#{COLOR_RESET}"
@@ -249,15 +229,12 @@ module Hammer
                       else
                         "0.0"
                       end
-
       # Fetch remote version
       response = HTTP::Client.get(REMOTE_VERSION_URL)
       raise "Failed to fetch remote version" unless response.success?
       remote_version = response.body.strip.gsub(/[\[\]]/, "").strip
-
       if remote_version > local_version
         puts "#{COLOR_GREEN}Upgrading from #{local_version} to #{remote_version}...#{COLOR_RESET}"
-
         # Download new binaries
         binaries = [
           {"hammer", "/usr/bin/hammer"},
@@ -266,7 +243,6 @@ module Hammer
           {"hammer-tui", "#{HAMMER_PATH}/hammer-tui"},
           {"hammer-builder", "#{HAMMER_PATH}/hammer-builder"}
         ]
-
         binaries.each do |bin|
           url = "#{RELEASE_BASE_URL}#{remote_version}/#{bin[0]}"
           resp = HTTP::Client.get(url)
@@ -274,10 +250,8 @@ module Hammer
           File.write(bin[1], resp.body)
           File.chmod(bin[1], 0o755)
         end
-
         # Update version file
         File.write(VERSION_FILE, "[ #{remote_version} ]")
-
         puts "#{COLOR_GREEN}Upgrade completed.#{COLOR_RESET}"
       else
         puts "#{COLOR_YELLOW}Already up to date (version #{local_version}).#{COLOR_RESET}"
@@ -287,27 +261,22 @@ module Hammer
       exit(1)
     end
   end
-
   private def self.run_core(subcommand : String, args : Array(String))
     binary = "#{HAMMER_PATH}/hammer-core"
     Process.run(binary, [subcommand] + args, output: Process::Redirect::Inherit, error: Process::Redirect::Inherit)
   end
-
   private def self.run_updater(subcommand : String, args : Array(String))
     binary = "#{HAMMER_PATH}/hammer-updater"
     Process.run(binary, [subcommand] + args, output: Process::Redirect::Inherit, error: Process::Redirect::Inherit)
   end
-
   private def self.run_builder(subcommand : String, args : Array(String))
     binary = "#{HAMMER_PATH}/hammer-builder"
     Process.run(binary, [subcommand] + args, output: Process::Redirect::Inherit, error: Process::Redirect::Inherit)
   end
-
   private def self.run_tui(args : Array(String))
     binary = "#{HAMMER_PATH}/hammer-tui"
     Process.run(binary, args, output: Process::Redirect::Inherit, error: Process::Redirect::Inherit)
   end
-
   private def self.about
     puts "#{COLOR_BOLD}#{COLOR_BLUE}Hammer CLI Tool for HackerOS Atomic#{COLOR_RESET}"
     puts "#{COLOR_GREEN}Version:#{COLOR_RESET} #{VERSION}"
@@ -319,13 +288,12 @@ module Hammer
     puts "- #{COLOR_YELLOW}hammer-tui:#{COLOR_RESET} TUI interface in Go with Bubble Tea"
     puts "#{COLOR_GREEN}Location:#{COLOR_RESET} #{HAMMER_PATH}"
   end
-
   private def self.usage
     puts "#{COLOR_BOLD}#{COLOR_BLUE}Usage: hammer <command> [options]#{COLOR_RESET}"
     puts ""
     puts "#{COLOR_GREEN}Commands:#{COLOR_RESET}"
-    puts " #{COLOR_YELLOW}install [--atomic] [--gui] <package>#{COLOR_RESET} Install a package (optionally atomically or as GUI)"
-    puts " #{COLOR_YELLOW}remove [--atomic] [--gui] <package>#{COLOR_RESET} Remove a package (optionally atomically or as GUI)"
+    puts " #{COLOR_YELLOW}install [--container] <package>#{COLOR_RESET} Install a package (optionally atomically or as GUI)"
+    puts " #{COLOR_YELLOW}remove [--container] <package>#{COLOR_RESET} Remove a package (optionally atomically or as GUI)"
     puts " #{COLOR_YELLOW}update#{COLOR_RESET} Update the system atomically"
     puts " #{COLOR_YELLOW}clean#{COLOR_RESET} Clean up unused resources"
     puts " #{COLOR_YELLOW}refresh#{COLOR_RESET} Refresh repositories"
@@ -343,5 +311,4 @@ module Hammer
     puts " #{COLOR_YELLOW}upgrade#{COLOR_RESET} Upgrade the hammer tool"
   end
 end
-
 Hammer.main
