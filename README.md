@@ -19,6 +19,9 @@ Atomic system for HackerOS
 - hammer hisotry - history of deploys
 - hammer status - show status of hammer
 - hammer about - information about hammer
+- hammer lock - make read-only system
+- hammer unlock - make not read-only system
+- hammer init - prepare for 
 - hammer tui - launch tui interface for hammer
 
 ## How working 
