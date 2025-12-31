@@ -39,6 +39,13 @@ module HammerUpdater
     end
   end
 
+  private def self.usage
+    puts "Usage: hammer-updater <command>"
+    puts "Commands:"
+    puts "  update - Update the system"
+    puts "  init - Initialize the system"
+  end
+
   private def self.ensure_top_mounted
     mountpoint_output = run_command("mountpoint", ["-q", BTRFS_TOP])
     return if mountpoint_output[:success]
@@ -415,4 +422,63 @@ module HammerUpdater
         return parts[1].strip if parts.size > 1
       end
     end
-    raise
+    raise "Subvolume ID not found."
+  end
+
+  private def self.create_transaction_marker(new_deployment : String)
+    File.write(TRANSACTION_MARKER, new_deployment)
+  end
+
+  private def self.remove_transaction_marker
+    File.delete(TRANSACTION_MARKER) if File.exists?(TRANSACTION_MARKER)
+  end
+
+  private def self.switch_to_deployment(new_deployment : String)
+    File.delete(CURRENT_SYMLINK) if File.exists?(CURRENT_SYMLINK)
+    File.symlink(new_deployment, CURRENT_SYMLINK)
+  end
+
+  private def self.set_status_broken(new_deployment : String)
+    meta_path = "#{new_deployment}/meta.json"
+    if File.exists?(meta_path)
+      meta = JSON.parse(File.read(meta_path)).as_h
+      meta["status"] = JSON::Any.new("broken")
+      File.write(meta_path, meta.to_json)
+    end
+  end
+
+  private def self.compute_system_version(new_deployment : String) : String
+    packages_list = "#{new_deployment}/tmp/packages.list"
+    if File.exists?(packages_list)
+      Digest::SHA256.hexdigest(File.read(packages_list))
+    else
+      "unknown"
+    end
+  end
+
+  private def self.write_meta(new_deployment : String, type : String, parent : String, kernel : String, system_version : String, status : String)
+    meta = {
+      "type"           => type,
+      "parent"         => parent,
+      "kernel"         => kernel,
+      "system_version" => system_version,
+      "status"         => status,
+      "timestamp"      => Time.local.to_s,
+    }
+    File.write("#{new_deployment}/meta.json", meta.to_json)
+  end
+
+  private def self.update_bootloader_entries(new_deployment : String)
+    # Placeholder for updating bootloader entries if needed outside chroot
+  end
+
+  private def self.sanity_check(new_deployment : String, kernel : String, temp_chroot : String)
+    unless File.exists?("#{temp_chroot}/boot/vmlinuz-#{kernel}")
+      raise "Kernel missing in new deployment."
+    end
+    # Additional checks can be added here
+  end
+
+end
+
+HammerUpdater.main
