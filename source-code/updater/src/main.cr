@@ -5,20 +5,12 @@ require "json"
 require "digest/sha256"
 
 module HammerUpdater
-  VERSION = "0.8" # Updated version
+  VERSION = "0.9" # Updated version
   DEPLOYMENTS_DIR = "/btrfs-root/deployments"
   CURRENT_SYMLINK = "/btrfs-root/current"
   LOCK_FILE = "/run/hammer.lock"
   TRANSACTION_MARKER = "/btrfs-root/hammer-transaction"
   BTRFS_TOP = "/btrfs-root"
-  LOG_DIR = "/usr/lib/HackerOS/hammer/logs/"
-
-  def self.log(message : String)
-    Dir.mkdir_p(LOG_DIR) unless Dir.exists?(LOG_DIR)
-    File.open("#{LOG_DIR}/hammer-updater.log", "a") do |f|
-      f.puts "#{Time.local}: #{message}"
-    end
-  end
 
   def self.main
     if LibC.getuid != 0
@@ -27,7 +19,6 @@ module HammerUpdater
     end
     return usage if ARGV.empty?
     command = ARGV.shift
-    log("Command: #{command} with args: #{ARGV.join(" ")}")
     case command
     when "update"
       update_command(ARGV)
@@ -37,13 +28,6 @@ module HammerUpdater
       usage
       exit(1)
     end
-  end
-
-  private def self.usage
-    puts "Usage: hammer-updater <command>"
-    puts "Commands:"
-    puts "  update - Update the system"
-    puts "  init - Initialize the system"
   end
 
   private def self.ensure_top_mounted
@@ -255,9 +239,7 @@ module HammerUpdater
       switch_to_deployment(new_deployment)
       # Do not remove transaction marker; it will be handled on boot
       puts "System initialized. Please reboot to apply the initial deployment."
-      log("System initialized")
     rescue ex : Exception
-      log("Init error: #{ex.message}")
       if new_deployment
         set_status_broken(new_deployment)
       end
@@ -278,11 +260,6 @@ module HammerUpdater
 
   private def self.update_system
     ensure_top_mounted
-    unless File.symlink?(CURRENT_SYMLINK)
-      initialize_system
-      puts "Please reboot the system and then run 'sudo hammer update' again."
-      return
-    end
     new_deployment : String? = nil
     temp_chroot : String? = nil
     temp_mounted = false
@@ -325,9 +302,7 @@ module HammerUpdater
       switch_to_deployment(new_deployment)
       remove_transaction_marker
       puts "System updated. Reboot to apply changes."
-      log("System updated")
     rescue ex : Exception
-      log("Update error: #{ex.message}")
       if new_deployment
         set_status_broken(new_deployment)
       end
@@ -425,60 +400,142 @@ module HammerUpdater
     raise "Subvolume ID not found."
   end
 
-  private def self.create_transaction_marker(new_deployment : String)
-    File.write(TRANSACTION_MARKER, new_deployment)
+  private def self.switch_to_deployment(deployment : String)
+    id = get_subvol_id(deployment)
+    output = run_command("btrfs", ["subvolume", "set-default", id, "/"])
+    raise "Failed to set default subvolume: #{output[:stderr]}" unless output[:success]
+    File.delete(CURRENT_SYMLINK) if File.exists?(CURRENT_SYMLINK)
+    File.symlink(deployment, CURRENT_SYMLINK)
+  end
+
+  private def self.write_meta(deployment : String, action : String, parent : String, kernel : String, system_version : String, status : String = "ready", rollback_reason : String? = nil)
+    meta = {
+      "created" => Time.utc.to_rfc3339,
+      "action" => action,
+      "parent" => parent,
+      "kernel" => kernel,
+      "system_version" => system_version,
+      "status" => status,
+      "rollback_reason" => rollback_reason,
+    }.reject { |k, v| v.nil? }
+    File.write("#{deployment}/meta.json", meta.to_json)
+  end
+
+  private def self.read_meta(deployment : String) : Hash(String, String)
+    meta_path = "#{deployment}/meta.json"
+    if File.exists?(meta_path)
+      JSON.parse(File.read(meta_path)).as_h.transform_values(&.to_s)
+    else
+      {} of String => String
+    end
+  end
+
+  private def self.update_meta(deployment : String, **updates)
+    meta = read_meta(deployment)
+    updates.each { |k, v| meta[k.to_s] = v.to_s if v }
+    File.write("#{deployment}/meta.json", meta.to_json)
+  end
+
+  private def self.set_status_broken(deployment : String)
+    update_meta(deployment, status: "broken")
+  end
+
+  private def self.create_transaction_marker(deployment : String)
+    data = {"deployment" => File.basename(deployment)}
+    File.write(TRANSACTION_MARKER, data.to_json)
   end
 
   private def self.remove_transaction_marker
     File.delete(TRANSACTION_MARKER) if File.exists?(TRANSACTION_MARKER)
   end
 
-  private def self.switch_to_deployment(new_deployment : String)
-    File.delete(CURRENT_SYMLINK) if File.exists?(CURRENT_SYMLINK)
-    File.symlink(new_deployment, CURRENT_SYMLINK)
-  end
-
-  private def self.set_status_broken(new_deployment : String)
-    meta_path = "#{new_deployment}/meta.json"
-    if File.exists?(meta_path)
-      meta = JSON.parse(File.read(meta_path)).as_h
-      meta["status"] = JSON::Any.new("broken")
-      File.write(meta_path, meta.to_json)
+  private def self.sanity_check(deployment : String, kernel : String, chroot_path : String = deployment)
+    unless File.exists?("#{deployment}/boot/vmlinuz-#{kernel}")
+      raise "Kernel file missing: /boot/vmlinuz-#{kernel}"
     end
+    unless File.exists?("#{deployment}/boot/initrd.img-#{kernel}")
+      raise "Initramfs file missing: /boot/initrd.img-#{kernel}"
+    end
+    # Check fstab
+    cmd = "chroot #{chroot_path} /bin/mount -f -a"
+    output = run_command("/bin/sh", ["-c", cmd])
+    raise "Fstab sanity check failed: #{output[:stderr]}" unless output[:success]
   end
 
-  private def self.compute_system_version(new_deployment : String) : String
-    packages_list = "#{new_deployment}/tmp/packages.list"
-    if File.exists?(packages_list)
-      Digest::SHA256.hexdigest(File.read(packages_list))
+  private def self.compute_system_version(deployment : String) : String
+    packages_file = "#{deployment}/tmp/packages.list"
+    if File.exists?(packages_file)
+      content = File.read(packages_file)
+      hash = Digest::SHA256.hexdigest(content)
+      File.delete(packages_file)
+      hash
     else
-      "unknown"
+      raise "Packages list not found for version computation"
     end
   end
 
-  private def self.write_meta(new_deployment : String, type : String, parent : String, kernel : String, system_version : String, status : String)
-    meta = {
-      "type"           => type,
-      "parent"         => parent,
-      "kernel"         => kernel,
-      "system_version" => system_version,
-      "status"         => status,
-      "timestamp"      => Time.local.to_s,
-    }
-    File.write("#{new_deployment}/meta.json", meta.to_json)
-  end
-
-  private def self.update_bootloader_entries(new_deployment : String)
-    # Placeholder for updating bootloader entries if needed outside chroot
-  end
-
-  private def self.sanity_check(new_deployment : String, kernel : String, temp_chroot : String)
-    unless File.exists?("#{temp_chroot}/boot/vmlinuz-#{kernel}")
-      raise "Kernel missing in new deployment."
+  private def self.get_fs_uuid : String
+    output = run_command("btrfs", ["filesystem", "show", "/"])
+    raise "Failed to get BTRFS UUID: #{output[:stderr]}" unless output[:success]
+    output[:stdout].lines.each do |line|
+      if line.includes?("uuid:")
+        return line.split("uuid:")[1].strip
+      end
     end
-    # Additional checks can be added here
+    raise "BTRFS UUID not found"
   end
 
+  private def self.get_deployments : Array(String)
+    Dir.entries(DEPLOYMENTS_DIR).select(&.starts_with?("hammer-")).map { |f| File.join(DEPLOYMENTS_DIR, f) }
+  rescue ex : Exception
+    raise "Failed to list deployments: #{ex.message}"
+  end
+
+  private def self.update_bootloader_entries(deployment : String)
+    good_deployments = get_deployments.select do |dep|
+      meta = read_meta(dep)
+      ["ready", "booted"].includes?(meta["status"]? || "unknown")
+    end.sort_by do |dep|
+      Time.parse_rfc3339(read_meta(dep)["created"]? || "1970-01-01T00:00:00Z")
+    end.reverse[0...5] # Limit to last 5 good deployments
+    entries = [] of String
+    uuid = get_fs_uuid
+    good_deployments.each do |dep|
+      name = File.basename(dep)
+      meta = read_meta(dep)
+      kernel = meta["kernel"]? || next
+      entry = <<-ENTRY
+menuentry 'HammerOS (#{name})' --class gnu-linux --class gnu --class os $menuentry_id_option 'gnulinux-#{name}-advanced-#{uuid}' {
+  insmod gzio
+  insmod part_gpt
+  insmod btrfs
+  search --no-floppy --fs-uuid --set=root #{uuid}
+  echo 'Loading Linux #{kernel} ...'
+  linux /deployments/#{name}/boot/vmlinuz-#{kernel} root=UUID=#{uuid} rw rootflags=subvol=deployments/#{name} quiet splash $vt_handoff
+  echo 'Loading initial ramdisk ...'
+  initrd /deployments/#{name}/boot/initrd.img-#{kernel}
+}
+ENTRY
+      entries << entry
+    end
+    script_content = <<-SCRIPT
+#!/bin/sh
+exec tail -n +3 $0
+# This file provides HammerOS deployment entries
+#{entries.join("\n")}
+SCRIPT
+    grub_file = "#{deployment}/etc/grub.d/25_hammer_entries"
+    File.write(grub_file, script_content)
+    File.chmod(grub_file, 0o755)
+  end
+
+  private def self.usage
+    puts "Usage: hammer-updater <command>"
+    puts ""
+    puts "Commands:"
+    puts " update Perform atomic system update"
+    puts " init Perform system initialization (linking without update)"
+  end
 end
 
 HammerUpdater.main
