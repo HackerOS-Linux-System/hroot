@@ -3,8 +3,6 @@
 // golang
 // cargo
 
->>> cd ~/.hackeros/ && sudo mkdir hammer
-> cd /tmp/hammer/
 > cd source-code
 >>> cd cli && shards build && sudo mv bin/hammer /usr/bin/
 >>> cd core && shards build && sudo mv bin/hammer-core /usr/lib/HackerOS/hammer/bin/
