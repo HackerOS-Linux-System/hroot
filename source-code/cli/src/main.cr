@@ -285,13 +285,11 @@ module Hammer
     end
     url = "https://github.com/HackerOS-Linux-System/hammer/issues/new"
     # Check if Vivaldi is available
-    vivaldi_status = Process.run("command", args: ["-v", "vivaldi"], output: Process::Redirect::Pipe, error: Process::Redirect::Pipe)
-    if vivaldi_status.success?
+    if Process.find_executable("vivaldi")
       Process.run("vivaldi", args: [url], output: Process::Redirect::Inherit, error: Process::Redirect::Inherit)
     else
       # Fall back to xdg-open
-      xdg_status = Process.run("command", args: ["-v", "xdg-open"], output: Process::Redirect::Pipe, error: Process::Redirect::Pipe)
-      if xdg_status.success?
+      if Process.find_executable("xdg-open")
         Process.run("xdg-open", args: [url], output: Process::Redirect::Inherit, error: Process::Redirect::Inherit)
       else
         puts "#{COLOR_RED}Error: No browser found to open the URL. Please install Vivaldi or ensure xdg-open is available.#{COLOR_RESET}"
