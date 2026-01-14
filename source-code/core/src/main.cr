@@ -33,6 +33,66 @@ def release_lock
   File.delete(LOCK_FILE) if File.exists?(LOCK_FILE)
 end
 
+def ensure_top_mounted
+  mountpoint_output = run_command("mountpoint", ["-q", BTRFS_TOP])
+  return if mountpoint_output[:success]
+  Dir.mkdir(BTRFS_TOP) unless Dir.exists?(BTRFS_TOP)
+  device = get_root_device
+  mount_output = run_command("mount", ["-o", "subvol=/", device, BTRFS_TOP])
+  raise "Failed to mount btrfs top: #{mount_output[:stderr]}" unless mount_output[:success]
+end
+
+def get_root_device : String
+  findmnt_output = run_command("findmnt", ["-no", "SOURCE", "/"])
+  raise "Failed to find root device: #{findmnt_output[:stderr]}" unless findmnt_output[:success]
+  findmnt_output[:stdout].strip.gsub(/\[\S+\]/, "")
+end
+
+def create_temp_dir(prefix : String) : String
+  output = run_command("mktemp", ["-d", "--tmpdir", "#{prefix}.XXXXXX"])
+  raise "Failed to create temp dir: #{output[:stderr]}" unless output[:success]
+  output[:stdout].strip
+end
+
+def snapshot_recursive(source : String, dest : String, writable : Bool)
+  args = ["subvolume", "snapshot"]
+  args << "-r" unless writable
+  args << source
+  args << dest
+  output = run_command("btrfs", args)
+  raise "Failed to create deployment: #{output[:stderr]}" unless output[:success]
+  list_output = run_command("btrfs", ["subvolume", "list", "-a", "--sort=path", source])
+  raise "Failed to list subvolumes: #{list_output[:stderr]}" unless list_output[:success]
+  lines = list_output[:stdout].lines
+  source_subvol = get_subvol_name(source)
+  prefix = if source_subvol.empty?
+             "<FS_TREE>/"
+           else
+             "<FS_TREE>/#{source_subvol}/"
+           end
+  prefix_length = prefix.size
+  lines.each do |line|
+    if line =~ /ID \d+ gen \d+ path (.*)/
+      full_path = $1
+      if full_path.starts_with?(prefix)
+        rel_path = full_path[prefix_length .. ]
+        next if rel_path.empty?
+        sub_dest = "#{dest}/#{rel_path}"
+        rmdir_output = run_command("rmdir", [sub_dest])
+        unless rmdir_output[:success]
+          raise "Failed to rmdir placeholder #{sub_dest}: #{rmdir_output[:stderr]}"
+        end
+        args = ["subvolume", "snapshot"]
+        args << "-r" unless writable
+        args << "#{source}/#{rel_path}"
+        args << sub_dest
+        output = run_command("btrfs", args)
+        raise "Failed to snapshot nested #{rel_path}: #{output[:stderr]}" unless output[:success]
+      end
+    end
+  end
+end
+
 def validate_system
   # Check if root is BTRFS
   output = run_command("btrfs", ["filesystem", "show", "/"])
@@ -105,36 +165,48 @@ end
 
 def atomic_install(package : String)
   new_deployment : String? = nil
+  temp_chroot : String? = nil
   mounted = false
   begin
     acquire_lock
     validate_system
+    ensure_top_mounted
     puts "Performing atomic install of #{package}..."
     # Create new deployment
     new_deployment = create_deployment(true)
     create_transaction_marker(new_deployment)
     parent = File.basename(File.readlink(CURRENT_SYMLINK))
-    bind_mounts_for_chroot(new_deployment, true)
+    device = get_root_device
+    new_subvol = get_subvol_name(new_deployment)
+    temp_chroot = create_temp_dir("hammer")
+    output = run_command("mount", ["-o", "subvol=#{new_subvol}", device, temp_chroot])
+    raise "Failed to mount temp_chroot: #{output[:stderr]}" unless output[:success]
+    bind_mounts_for_chroot(temp_chroot, true)
     mounted = true
     # Check if already installed in chroot
-    check_cmd = "chroot #{new_deployment} /bin/sh -c 'dpkg -s #{package}'"
+    check_cmd = "chroot #{temp_chroot} /bin/sh -c 'dpkg -s #{package}'"
     check_output = run_command("/bin/sh", ["-c", check_cmd])
     if check_output[:success]
       puts "Package #{package} is already installed in the system."
       raise "Already installed" # To trigger cleanup
     end
-    chroot_cmd = "chroot #{new_deployment} /bin/sh -c 'apt update && apt install -y #{package} && apt autoremove -y && dpkg -l > /tmp/packages.list && update-initramfs -u -k all && update-grub'"
+    chroot_cmd = "chroot #{temp_chroot} /bin/sh -c 'apt update && apt install -y #{package} && apt autoremove -y && dpkg -l > /tmp/packages.list && update-initramfs -u -k all'"
     output = run_command("/bin/sh", ["-c", chroot_cmd])
     if !output[:success]
       raise "Failed to install in chroot: #{output[:stderr]}"
     end
-    bind_mounts_for_chroot(new_deployment, false)
-    mounted = false
-    kernel = get_kernel_version(new_deployment)
-    sanity_check(new_deployment, kernel)
+    kernel = get_kernel_version(temp_chroot)
+    sanity_check(new_deployment, kernel, temp_chroot)
     system_version = compute_system_version(new_deployment)
     write_meta(new_deployment, "install #{package}", parent, kernel, system_version, "ready")
     update_bootloader_entries(new_deployment)
+    grub_cmd = "chroot #{temp_chroot} /bin/sh -c 'update-grub'"
+    grub_output = run_command("/bin/sh", ["-c", grub_cmd])
+    raise "Failed to update grub in chroot: #{grub_output[:stderr]}" unless grub_output[:success]
+    bind_mounts_for_chroot(temp_chroot, false)
+    output = run_command("umount", [temp_chroot])
+    raise "Failed to umount temp_chroot: #{output[:stderr]}" unless output[:success]
+    mounted = false
     set_subvolume_readonly(new_deployment, true)
     switch_to_deployment(new_deployment)
     remove_transaction_marker
@@ -145,8 +217,12 @@ def atomic_install(package : String)
     end
     raise ex
   ensure
-    if mounted && new_deployment
-      bind_mounts_for_chroot(new_deployment, false) rescue nil
+    if mounted && temp_chroot
+      bind_mounts_for_chroot(temp_chroot, false) rescue nil
+      run_command("umount", [temp_chroot]) rescue nil
+    end
+    if temp_chroot && Dir.exists?(temp_chroot)
+      FileUtils.rm_rf(temp_chroot) rescue nil
     end
     release_lock
   end
@@ -154,36 +230,48 @@ end
 
 def atomic_remove(package : String)
   new_deployment : String? = nil
+  temp_chroot : String? = nil
   mounted = false
   begin
     acquire_lock
     validate_system
+    ensure_top_mounted
     puts "Performing atomic remove of #{package}..."
     # Create new deployment
     new_deployment = create_deployment(true)
     create_transaction_marker(new_deployment)
     parent = File.basename(File.readlink(CURRENT_SYMLINK))
-    bind_mounts_for_chroot(new_deployment, true)
+    device = get_root_device
+    new_subvol = get_subvol_name(new_deployment)
+    temp_chroot = create_temp_dir("hammer")
+    output = run_command("mount", ["-o", "subvol=#{new_subvol}", device, temp_chroot])
+    raise "Failed to mount temp_chroot: #{output[:stderr]}" unless output[:success]
+    bind_mounts_for_chroot(temp_chroot, true)
     mounted = true
     # Check if installed in chroot
-    check_cmd = "chroot #{new_deployment} /bin/sh -c 'dpkg -s #{package}'"
+    check_cmd = "chroot #{temp_chroot} /bin/sh -c 'dpkg -s #{package}'"
     check_output = run_command("/bin/sh", ["-c", check_cmd])
     unless check_output[:success]
       puts "Package #{package} is not installed in the system."
       raise "Not installed" # To trigger cleanup
     end
-    chroot_cmd = "chroot #{new_deployment} /bin/sh -c 'apt remove -y #{package} && apt autoremove -y && dpkg -l > /tmp/packages.list && update-initramfs -u -k all && update-grub'"
+    chroot_cmd = "chroot #{temp_chroot} /bin/sh -c 'apt remove -y #{package} && apt autoremove -y && dpkg -l > /tmp/packages.list && update-initramfs -u -k all'"
     output = run_command("/bin/sh", ["-c", chroot_cmd])
     if !output[:success]
       raise "Failed to remove in chroot: #{output[:stderr]}"
     end
-    bind_mounts_for_chroot(new_deployment, false)
-    mounted = false
-    kernel = get_kernel_version(new_deployment)
-    sanity_check(new_deployment, kernel)
+    kernel = get_kernel_version(temp_chroot)
+    sanity_check(new_deployment, kernel, temp_chroot)
     system_version = compute_system_version(new_deployment)
     write_meta(new_deployment, "remove #{package}", parent, kernel, system_version, "ready")
     update_bootloader_entries(new_deployment)
+    grub_cmd = "chroot #{temp_chroot} /bin/sh -c 'update-grub'"
+    grub_output = run_command("/bin/sh", ["-c", grub_cmd])
+    raise "Failed to update grub in chroot: #{grub_output[:stderr]}" unless grub_output[:success]
+    bind_mounts_for_chroot(temp_chroot, false)
+    output = run_command("umount", [temp_chroot])
+    raise "Failed to umount temp_chroot: #{output[:stderr]}" unless output[:success]
+    mounted = false
     set_subvolume_readonly(new_deployment, true)
     switch_to_deployment(new_deployment)
     remove_transaction_marker
@@ -194,8 +282,12 @@ def atomic_remove(package : String)
     end
     raise ex
   ensure
-    if mounted && new_deployment
-      bind_mounts_for_chroot(new_deployment, false) rescue nil
+    if mounted && temp_chroot
+      bind_mounts_for_chroot(temp_chroot, false) rescue nil
+      run_command("umount", [temp_chroot]) rescue nil
+    end
+    if temp_chroot && Dir.exists?(temp_chroot)
+      FileUtils.rm_rf(temp_chroot) rescue nil
     end
     release_lock
   end
@@ -207,13 +299,10 @@ def create_deployment(writable : Bool) : String
   current = File.readlink(CURRENT_SYMLINK)
   timestamp = Time.local.to_s("%Y%m%d%H%M%S")
   new_deployment = "#{DEPLOYMENTS_DIR}/hammer-#{timestamp}"
-  args = ["subvolume", "snapshot"]
-  args << "-r" unless writable
-  args << current
-  args << new_deployment
-  output = run_command("btrfs", args)
-  raise "Failed to create deployment: #{output[:stderr]}" unless output[:success]
-  set_subvolume_readonly(new_deployment, false) if writable
+  snapshot_recursive(current, new_deployment, writable)
+  if writable
+    set_readonly_recursive(new_deployment, false)
+  end
   puts "Deployment created at: #{new_deployment}"
   new_deployment
 end
@@ -267,18 +356,37 @@ def clean_up
 end
 
 def refresh
+  temp_chroot : String? = nil
+  mounted = false
   begin
     acquire_lock
     validate_system
+    ensure_top_mounted
     puts "Refreshing repositories..."
     current = File.readlink(CURRENT_SYMLINK)
-    bind_mounts_for_chroot(current, true)
-    chroot_cmd = "chroot #{current} /bin/sh -c 'apt update'"
+    device = get_root_device
+    current_subvol = get_subvol_name(current)
+    temp_chroot = create_temp_dir("hammer")
+    output = run_command("mount", ["-o", "subvol=#{current_subvol}", device, temp_chroot])
+    raise "Failed to mount temp_chroot: #{output[:stderr]}" unless output[:success]
+    bind_mounts_for_chroot(temp_chroot, true)
+    mounted = true
+    chroot_cmd = "chroot #{temp_chroot} /bin/sh -c 'apt update'"
     output = run_command("/bin/sh", ["-c", chroot_cmd])
-    bind_mounts_for_chroot(current, false)
+    bind_mounts_for_chroot(temp_chroot, false)
+    output_umount = run_command("umount", [temp_chroot])
+    raise "Failed to umount temp_chroot: #{output_umount[:stderr]}" unless output_umount[:success]
+    mounted = false
     raise "Failed to refresh: #{output[:stderr]}" unless output[:success]
     puts "Refresh completed."
   ensure
+    if mounted && temp_chroot
+      bind_mounts_for_chroot(temp_chroot, false) rescue nil
+      run_command("umount", [temp_chroot]) rescue nil
+    end
+    if temp_chroot && Dir.exists?(temp_chroot)
+      FileUtils.rm_rf(temp_chroot) rescue nil
+    end
     release_lock
   end
 end
@@ -309,23 +417,58 @@ end
 
 def bind_mounts_for_chroot(chroot_path : String, mount : Bool)
   dirs = ["proc", "sys", "dev"]
-  dirs.each do |dir|
-    target = "#{chroot_path}/#{dir}"
-    Dir.mkdir_p(target)
-    if mount
+  if mount
+    dirs.each do |dir|
+      target = "#{chroot_path}/#{dir}"
+      Dir.mkdir_p(target) unless Dir.exists?(target)
       output = run_command("mount", ["--bind", "/#{dir}", target])
-    else
-      output = run_command("umount", [target])
+      raise "Failed to mount #{dir}: #{output[:stderr]}" unless output[:success]
     end
-    raise "Failed to #{mount ? "mount" : "umount"} #{dir}: #{output[:stderr]}" unless output[:success]
+    dev_pts = "#{chroot_path}/dev/pts"
+    Dir.mkdir_p(dev_pts) unless Dir.exists?(dev_pts)
+    output = run_command("mount", ["-t", "devpts", "devpts", dev_pts, "-o", "ptmxmode=0666"])
+    raise "Failed to mount /dev/pts: #{output[:stderr]}" unless output[:success]
+    dev_shm = "#{chroot_path}/dev/shm"
+    Dir.mkdir_p(dev_shm) unless Dir.exists?(dev_shm)
+    output = run_command("mount", ["-t", "tmpfs", "tmpfs", dev_shm])
+    raise "Failed to mount /dev/shm: #{output[:stderr]}" unless output[:success]
+    resolv_target = "#{chroot_path}/etc/resolv.conf"
+    begin
+      File.write(resolv_target, File.read("/etc/resolv.conf"))
+    rescue ex
+      puts "Warning: Failed to copy resolv.conf: #{ex.message}"
+    end
+  else
+    dev_shm = "#{chroot_path}/dev/shm"
+    if Dir.exists?(dev_shm)
+      output = run_command("umount", [dev_shm])
+    end
+    dev_pts = "#{chroot_path}/dev/pts"
+    if Dir.exists?(dev_pts)
+      output = run_command("umount", [dev_pts])
+    end
+    dirs.reverse.each do |dir|
+      target = "#{chroot_path}/#{dir}"
+      output = run_command("umount", [target])
+      raise "Failed to umount #{dir}: #{output[:stderr]}" unless output[:success]
+    end
   end
 end
 
 def get_kernel_version(chroot_path : String) : String
-  cmd = "chroot #{chroot_path} /bin/sh -c \"dpkg -l | grep ^ii | grep linux-image | awk '{print \\$3}' | sort -V | tail -1\""
+  cmd = "chroot #{chroot_path} /bin/sh -c \"dpkg -l | grep ^ii | grep linux-image-[0-9] | awk '{print \\$2}' | sed 's/linux-image-//' | sort -V | tail -1\""
   output = run_command("/bin/sh", ["-c", cmd])
   raise "Failed to get kernel version: #{output[:stderr]}" unless output[:success]
   output[:stdout].strip
+end
+
+def with_writable_subvol(path : String, &)
+  prop_output = run_command("btrfs", ["property", "get", "-ts", path, "ro"])
+  was_ro = prop_output[:success] && prop_output[:stdout].strip == "ro=true"
+  set_subvolume_readonly(path, false) if was_ro
+  yield
+ensure
+  set_subvolume_readonly(path, true) if was_ro
 end
 
 def write_meta(deployment : String, action : String, parent : String, kernel : String, system_version : String, status : String = "ready", rollback_reason : String? = nil)
@@ -338,7 +481,9 @@ def write_meta(deployment : String, action : String, parent : String, kernel : S
     "status" => status,
     "rollback_reason" => rollback_reason,
   }.reject { |k, v| v.nil? }
-  File.write("#{deployment}/meta.json", meta.to_json)
+  with_writable_subvol(deployment) do
+    File.write("#{deployment}/meta.json", meta.to_json)
+  end
 end
 
 def read_meta(deployment : String) : Hash(String, String)
@@ -353,7 +498,9 @@ end
 def update_meta(deployment : String, **updates)
   meta = read_meta(deployment)
   updates.each { |k, v| meta[k.to_s] = v.to_s if v }
-  File.write("#{deployment}/meta.json", meta.to_json)
+  with_writable_subvol(deployment) do
+    File.write("#{deployment}/meta.json", meta.to_json)
+  end
 end
 
 def set_status_broken(deployment : String)
@@ -440,7 +587,7 @@ def hammer_check_transaction
   end
 end
 
-def sanity_check(deployment : String, kernel : String)
+def sanity_check(deployment : String, kernel : String, chroot_path : String = deployment)
   unless File.exists?("#{deployment}/boot/vmlinuz-#{kernel}")
     raise "Kernel file missing: /boot/vmlinuz-#{kernel}"
   end
@@ -448,7 +595,7 @@ def sanity_check(deployment : String, kernel : String)
     raise "Initramfs file missing: /boot/initrd.img-#{kernel}"
   end
   # Check fstab
-  cmd = "chroot #{deployment} /bin/mount -f -a"
+  cmd = "chroot #{chroot_path} /bin/mount -f -a"
   output = run_command("/bin/sh", ["-c", cmd])
   raise "Fstab sanity check failed: #{output[:stderr]}" unless output[:success]
 end
@@ -564,22 +711,38 @@ else
       package = parse_install_remove(ARGV)
       remove_package(package)
     when "deploy"
+      new_deployment : String? = nil
+      temp_chroot : String? = nil
+      mounted = false
       begin
         acquire_lock
         validate_system
+        ensure_top_mounted
         new_deployment = create_deployment(true)
         create_transaction_marker(new_deployment)
         parent = File.basename(File.readlink(CURRENT_SYMLINK))
-        bind_mounts_for_chroot(new_deployment, true)
-        chroot_cmd = "chroot #{new_deployment} /bin/sh -c 'dpkg -l > /tmp/packages.list && update-initramfs -u -k all && update-grub'"
+        device = get_root_device
+        new_subvol = get_subvol_name(new_deployment)
+        temp_chroot = create_temp_dir("hammer")
+        output = run_command("mount", ["-o", "subvol=#{new_subvol}", device, temp_chroot])
+        raise "Failed to mount temp_chroot: #{output[:stderr]}" unless output[:success]
+        bind_mounts_for_chroot(temp_chroot, true)
+        mounted = true
+        chroot_cmd = "chroot #{temp_chroot} /bin/sh -c 'dpkg -l > /tmp/packages.list && update-initramfs -u -k all'"
         output = run_command("/bin/sh", ["-c", chroot_cmd])
         raise "Failed in chroot: #{output[:stderr]}" unless output[:success]
-        bind_mounts_for_chroot(new_deployment, false)
-        kernel = get_kernel_version(new_deployment)
-        sanity_check(new_deployment, kernel)
+        kernel = get_kernel_version(temp_chroot)
+        sanity_check(new_deployment, kernel, temp_chroot)
         system_version = compute_system_version(new_deployment)
         write_meta(new_deployment, "deploy", parent, kernel, system_version, "ready")
         update_bootloader_entries(new_deployment)
+        grub_cmd = "chroot #{temp_chroot} /bin/sh -c 'update-grub'"
+        grub_output = run_command("/bin/sh", ["-c", grub_cmd])
+        raise "Failed to update grub in chroot: #{grub_output[:stderr]}" unless grub_output[:success]
+        bind_mounts_for_chroot(temp_chroot, false)
+        output = run_command("umount", [temp_chroot])
+        raise "Failed to umount temp_chroot: #{output[:stderr]}" unless output[:success]
+        mounted = false
         set_subvolume_readonly(new_deployment, true)
         switch_to_deployment(new_deployment)
         remove_transaction_marker
@@ -589,6 +752,13 @@ else
         end
         raise ex
       ensure
+        if mounted && temp_chroot
+          bind_mounts_for_chroot(temp_chroot, false) rescue nil
+          run_command("umount", [temp_chroot]) rescue nil
+        end
+        if temp_chroot && Dir.exists?(temp_chroot)
+          FileUtils.rm_rf(temp_chroot) rescue nil
+        end
         release_lock
       end
     when "switch"
@@ -615,4 +785,3 @@ else
     exit(1)
   end
 end
-
