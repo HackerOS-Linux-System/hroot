@@ -233,8 +233,9 @@ module HammerUpdater
       bind_mounts_for_chroot(temp_chroot, false)
       chroot_mounted = false
       umount_output = run_command("umount", [temp_chroot])
+      raise "Failed to umount temp_chroot: #{umount_output[:stderr]}" unless umount_output[:success]
       temp_mounted = false
-      set_readonly_recursive(new_deployment, true)
+      set_subvolume_readonly(new_deployment, true)
       create_transaction_marker(new_deployment)
       switch_to_deployment(new_deployment)
       # Do not remove transaction marker; it will be handled on boot
@@ -297,8 +298,9 @@ module HammerUpdater
       bind_mounts_for_chroot(temp_chroot, false)
       chroot_mounted = false
       umount_output = run_command("umount", [temp_chroot])
+      raise "Failed to umount temp_chroot: #{umount_output[:stderr]}" unless umount_output[:success]
       temp_mounted = false
-      set_readonly_recursive(new_deployment, true)
+      set_subvolume_readonly(new_deployment, true)
       switch_to_deployment(new_deployment)
       remove_transaction_marker
       puts "System updated. Reboot to apply changes."
@@ -408,6 +410,15 @@ module HammerUpdater
     File.symlink(deployment, CURRENT_SYMLINK)
   end
 
+  private def self.with_writable_subvol(path : String, &)
+    prop_output = run_command("btrfs", ["property", "get", "-ts", path, "ro"])
+    was_ro = prop_output[:success] && prop_output[:stdout].strip == "ro=true"
+    set_subvolume_readonly(path, false) if was_ro
+    yield
+  ensure
+    set_subvolume_readonly(path, true) if was_ro
+  end
+
   private def self.write_meta(deployment : String, action : String, parent : String, kernel : String, system_version : String, status : String = "ready", rollback_reason : String? = nil)
     meta = {
       "created" => Time.utc.to_rfc3339,
@@ -418,7 +429,9 @@ module HammerUpdater
       "status" => status,
       "rollback_reason" => rollback_reason,
     }.reject { |k, v| v.nil? }
-    File.write("#{deployment}/meta.json", meta.to_json)
+    with_writable_subvol(deployment) do
+      File.write("#{deployment}/meta.json", meta.to_json)
+    end
   end
 
   private def self.read_meta(deployment : String) : Hash(String, String)
@@ -433,7 +446,9 @@ module HammerUpdater
   private def self.update_meta(deployment : String, **updates)
     meta = read_meta(deployment)
     updates.each { |k, v| meta[k.to_s] = v.to_s if v }
-    File.write("#{deployment}/meta.json", meta.to_json)
+    with_writable_subvol(deployment) do
+      File.write("#{deployment}/meta.json", meta.to_json)
+    end
   end
 
   private def self.set_status_broken(deployment : String)
