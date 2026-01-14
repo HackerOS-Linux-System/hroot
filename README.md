@@ -22,5 +22,7 @@ Atomic system for HackerOS
 - hammer unlock - make not read-only system
 - hammer init - prepare for 
 - hammer tui - launch tui interface for hammer
+- hammer issue - report an error
 
-## How working 
+## About
+The hammer tool is a tool for the atomic edition of HackerOS, it works using btrfs snapshots and for installing container packages (if you want).
