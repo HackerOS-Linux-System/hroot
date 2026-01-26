@@ -1,11 +1,11 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::symlink;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::path::Path;
+use std::process::Command;
 
 use chrono::prelude::*;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, CommandFactory};
 use nix::unistd::Uid;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -190,7 +190,8 @@ fn snapshot_recursive(source: &str, dest: &str, writable: bool) -> Result<(), io
                 if !writable {
                     sub_args.push("-r");
                 }
-                sub_args.push(&format!("{}/{}", source, rel_path));
+                let source_rel = format!("{}/{}", source, rel_path);
+                sub_args.push(&source_rel);
                 sub_args.push(&sub_dest);
                 let (sub_success, _, sub_stderr) = run_command("btrfs", &sub_args)?;
                 if !sub_success {
@@ -221,7 +222,7 @@ fn get_subvol_name(path: &str) -> Result<String, io::Error> {
 fn validate_system() -> Result<(), io::Error> {
     let (success, _, stderr) = run_command("btrfs", &["filesystem", "show", "/"])?;
     if !success {
-        return Err(io::Error::new(io::ErrorKind::Other, "Root filesystem is not BTRFS.".to_string()));
+        return Err(io::Error::new(io::ErrorKind::Other, format!("Root filesystem is not BTRFS: {}", stderr)));
     }
     if !Path::new(CURRENT_SYMLINK).is_symlink() {
         return Err(io::Error::new(
@@ -273,7 +274,7 @@ fn atomic_install(package: &str) -> Result<(), io::Error> {
         let (check_success, _, check_stderr) = run_command("/bin/sh", &["-c", &check_cmd])?;
         if check_success {
             println!("Package {} is already installed in the system.", package);
-            return Err(io::Error::new(io::ErrorKind::Other, "Already installed"));
+            return Err(io::Error::new(io::ErrorKind::Other, format!("Already installed: {}", check_stderr)));
         }
         let chroot_cmd = format!(
             "chroot {} /bin/sh -c 'apt update && apt install -y {} && apt autoremove -y && dpkg -l > /tmp/packages.list && update-initramfs -u -k all'",
@@ -364,7 +365,7 @@ fn atomic_remove(package: &str) -> Result<(), io::Error> {
         let (check_success, _, check_stderr) = run_command("/bin/sh", &["-c", &check_cmd])?;
         if !check_success {
             println!("Package {} is not installed in the system.", package);
-            return Err(io::Error::new(io::ErrorKind::Other, "Not installed"));
+            return Err(io::Error::new(io::ErrorKind::Other, format!("Not installed: {}", check_stderr)));
         }
         let chroot_cmd = format!(
             "chroot {} /bin/sh -c 'apt remove -y {} && apt autoremove -y && dpkg -l > /tmp/packages.list && update-initramfs -u -k all'",
@@ -524,7 +525,7 @@ fn rollback(n: u32) -> Result<(), io::Error> {
     update_meta(
         &old_current,
         Some("rollback".to_string()),
-        Some("user requested".to_string()),
+                Some("user requested".to_string()),
     )?;
     println!("Rollback completed. Reboot to apply.");
     release_lock();
@@ -619,7 +620,11 @@ fn atomic_refresh() -> Result<(), io::Error> {
 fn init() -> Result<(), io::Error> {
     acquire_lock()?;
     ensure_top_mounted()?;
-    let current = create_deployment(false)?;
+    fs::create_dir_all(DEPLOYMENTS_DIR)?;
+    let timestamp = Local::now().format("%Y%m%d%H%M%S").to_string();
+    let new_deployment = format!("{}/hammer-{}", DEPLOYMENTS_DIR, timestamp);
+    snapshot_recursive(BTRFS_TOP, &new_deployment, false)?;
+    let current = new_deployment;
     set_subvolume_readonly(&current, true)?;
     switch_to_deployment_inner(&current)?;
     let kernel = get_kernel_version("/")?;
