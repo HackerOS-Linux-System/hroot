@@ -1,13 +1,14 @@
-// shards
 // crystal
 // golang
 // cargo
+// bun
 
 > cd source-code
->>> cd cli && shards build && sudo mv bin/hammer /usr/bin/
->>> cd core && shards build && sudo mv bin/hammer-core /usr/lib/HackerOS/hammer/bin/
->>> cd builder && shards build && sudo mv bin/hammer-builder sudo mv hammer-builder /usr/lib/HackerOS/hammer/bin/
->>> cd updater && shards build && sudo mv bin/hammer-updater /usr/lib/HackerOS/hammer/bin/
->>> cd read && shards build && sudo mv bin/hammer-read /usr/lib/HackerOS/hammer/bin/
->>> cd tui && go get hammer-tui && go build && sudo mv hammer-tui /usr/lib/HackerOS/hammer/bin/
->>> cd progress-bar && cargo build --release && sudo mv target/release/hammer-progress-bar sudo mv hammer-progress-bar /usr/lib/HackerOS/hammer/bin/
+>>> cd cli && # bun add commander chalk axios figlet gradient-string boxen ora open which @types/figlet @types/gradient-string @types/which && bun build ./main.ts --compile --outfile hammer
+>>> cd core && cargo build --release
+>>> cd builder && shards build
+>>> cd updater && cargo build --release
+>>> cd containers && shards build
+>>> cd read && cargo build --release
+>>> cd tui && go get hammer-tui && go build
+>>> cd progress-bar && cargo build --release
