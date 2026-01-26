@@ -4,7 +4,7 @@
 // bun
 
 > cd source-code
->>> cd cli && # bun add commander chalk axios figlet gradient-string boxen ora open which @types/figlet @types/gradient-string @types/which && bun build ./main.ts --compile --outfile hammer
+>>> cd cli && bun add commander chalk axios figlet gradient-string boxen ora open which @types/figlet @types/gradient-string @types/which && bun build ./main.ts --compile --outfile hammer
 >>> cd core && cargo build --release
 >>> cd builder && shards build
 >>> cd updater && cargo build --release
