@@ -115,5 +115,5 @@ fn print_help() {
 }
 
 fn print_version() {
-    println!("hammer 0.9.0");
+    println!("hammer 1.0");
 }
