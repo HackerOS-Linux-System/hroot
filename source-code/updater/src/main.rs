@@ -68,16 +68,27 @@ fn main() -> Result<()> {
 fn handle_init() -> Result<()> {
     Logger::info("Initializing OSTree repository...");
 
-    if !Path::new(OSTREE_REPO).exists() {
-        fs::create_dir_all(OSTREE_REPO)?;
+    let repo_path = Path::new(OSTREE_REPO);
+    let config_path = repo_path.join("config");
+
+    // Check if it is a valid OSTree repo by looking for the config file.
+    // Just checking directory existence is not enough (it might be an empty dir).
+    if !config_path.exists() {
+        if !repo_path.exists() {
+            fs::create_dir_all(OSTREE_REPO)?;
+        }
+
+        // Use 'archive' mode instead of 'bare-user' for system deployments to preserve ownership correctly.
+        // 'bare-user' is for unprivileged setups and strips ownership info which breaks bootable systems.
+        // However, if the user specifically requested bare-user before, we switch to 'archive' (z2) which is safest for generic fs.
         run_command(
             "ostree",
-            &["--repo", OSTREE_REPO, "init", "--mode=bare-user"],
-            "OSTree Init",
+            &[&format!("--repo={}", OSTREE_REPO), "init", "--mode=archive"],
+                    "OSTree Init",
         )?;
         Logger::success("Initialized /ostree/repo");
     } else {
-        Logger::info("OSTree repository already exists.");
+        Logger::info("OSTree repository already valid.");
     }
 
     // Initialize Cache Dirs
@@ -93,16 +104,37 @@ fn handle_init() -> Result<()> {
 fn compute_update_hash(config: &HammerConfig) -> Result<String> {
     let spinner = create_spinner("Fetching remote repository metadata...");
 
+    // Try InRelease first (modern default), fallback to Release
     let release_url = format!(
-        "{}/dists/{}/Release",
+        "{}/dists/{}/InRelease",
         config.repository.url, config.repository.suite
     );
-    let resp = reqwest::blocking::get(&release_url)
-    .context("Failed to fetch Release file")?
-    .text()?;
+
+    // Log what we are checking to help debug
+    // We pause spinner briefly or just log before spinner
+    spinner.set_message(format!("Fetching metadata from {}...", release_url));
+
+    let resp_result = reqwest::blocking::get(&release_url)
+    .and_then(|r| r.error_for_status())
+    .map(|r| r.text());
+
+    let resp_text = match resp_result {
+        Ok(Ok(text)) => text,
+        _ => {
+            // Fallback to Release
+            let fallback_url = format!(
+                "{}/dists/{}/Release",
+                config.repository.url, config.repository.suite
+            );
+            spinner.set_message(format!("InRelease missing, trying {}...", fallback_url));
+            reqwest::blocking::get(&fallback_url)
+            .context("Failed to fetch Release file")?
+            .text()?
+        }
+    };
 
     let mut hasher = Sha256::new();
-    hasher.update(resp.as_bytes());
+    hasher.update(resp_text.as_bytes());
 
     hasher.update(config.packages.include.join(",").as_bytes());
     hasher.update(config.packages.exclude.join(",").as_bytes());
@@ -127,9 +159,10 @@ fn compute_update_hash(config: &HammerConfig) -> Result<String> {
 fn get_current_commit_hash() -> Result<Option<String>> {
     let output = std::process::Command::new("ostree")
     .args(&[
-        "show",
-        "--print-metadata-key=hammer.update-hash",
-        BRANCH_NAME,
+        &format!("--repo={}", OSTREE_REPO),
+          "show",
+          "--print-metadata-key=hammer.update-hash",
+          BRANCH_NAME,
     ])
     .output();
 
@@ -153,7 +186,14 @@ fn get_current_commit_hash() -> Result<Option<String>> {
 }
 
 fn handle_check() -> Result<()> {
+    // Ensure repo structure is valid even for check
+    handle_init()?;
+
     let config = load_config()?;
+
+    // Log explicit source usage for user verification
+    Logger::info(&format!("Checking updates for suite: {} ({})", config.repository.suite.cyan(), config.repository.url));
+
     let remote_hash = compute_update_hash(&config)?;
     let local_hash = get_current_commit_hash()?;
 
@@ -199,7 +239,12 @@ fn handle_layer(path: String) -> Result<()> {
 }
 
 fn handle_update(force: bool, preview_etc: bool, _new_pkg: Option<PathBuf>) -> Result<()> {
+    // Ensure OSTree repo is initialized before attempting update
+    handle_init()?;
+
     let config = load_config()?;
+
+    Logger::info(&format!("Update source: {} ({})", config.repository.suite.cyan(), config.repository.url));
 
     // 1. Idempotency Check
     let update_hash = compute_update_hash(&config)?;
@@ -243,30 +288,29 @@ fn handle_update(force: bool, preview_etc: bool, _new_pkg: Option<PathBuf>) -> R
 
     // Setup apt cache
     // We mount the host CACHE_DIR into the container/chroot
+    // And we bind-mount it so the chroot can access the files
     let apt_opt_cache = format!("Dir::Cache::Archives \"{}\";", CACHE_DIR);
-
-    // Setup local packages
-    // If we have packages in LOCAL_PKG_DIR, we need to tell mmdebstrap to install them.
-    // The easiest way is to use --include with path, but mmdebstrap needs them reachable.
-    // We'll skip complex logic for now and assume the 'include' list covers repo packages,
-    // and we append any local .deb files to the command line if supported,
-    // or copy them in via hook.
+    let cache_hook = format!(
+        "mkdir -p \"$1\"{0} && mount --bind {0} \"$1\"{0}",
+        CACHE_DIR
+    );
 
     let mut args = vec![
         "--variant=minbase",
         &include_flag,
         "--format=directory",
-        "--aptopt", &apt_opt_cache, // USE CACHE!
+        "--aptopt", &apt_opt_cache,
+        "--setup-hook", &cache_hook,
         &config.repository.suite,
         rootfs_str,
         &config.repository.url,
     ];
 
     // If local packages exist, we need to install them.
-    // Since mmdebstrap doesn't natively take a list of local .debs in main args easily mixed with repo,
-    // we use a setup-hook to copy them in and dpkg -i them.
+    // We use a setup-hook to copy them in and dpkg -i them.
+    // NOTE: replaced 'copy-in' (non-standard) with 'cp -r'
     let hook_cmd = format!(
-        "copy-in {} /tmp/local-pkgs && chroot \"$1\" dpkg -iR /tmp/local-pkgs && chroot \"$1\" rm -rf /tmp/local-pkgs",
+        "mkdir -p \"$1\"/tmp/local-pkgs && cp -r {}/* \"$1\"/tmp/local-pkgs/ && chroot \"$1\" dpkg -iR /tmp/local-pkgs && chroot \"$1\" rm -rf /tmp/local-pkgs",
         LOCAL_PKG_DIR
     );
 
@@ -275,7 +319,10 @@ fn handle_update(force: bool, preview_etc: bool, _new_pkg: Option<PathBuf>) -> R
     // Only add hook if directory is not empty
     let has_local = Path::new(LOCAL_PKG_DIR).exists() && fs::read_dir(LOCAL_PKG_DIR)?.next().is_some();
     if has_local {
-        args.insert(1, &setup_hook_arg);
+        // Insert before positional arguments (suite, rootfs, url)
+        // args.len() is currently N. The last 3 are positional.
+        let pos = args.len() - 3;
+        args.insert(pos, &setup_hook_arg);
     }
 
     run_command("mmdebstrap", &args, "Building RootFS")?;
@@ -319,13 +366,12 @@ fn handle_update(force: bool, preview_etc: bool, _new_pkg: Option<PathBuf>) -> R
     run_command(
         "ostree",
         &[
-            "--repo",
-            OSTREE_REPO,
-            "commit",
-            "--branch",
-            BRANCH_NAME,
-            "--subject",
-            &format!("Update {}", timestamp),
+            &format!("--repo={}", OSTREE_REPO),
+                "commit",
+                "--branch",
+                BRANCH_NAME,
+                "--subject",
+                &format!("Update {}", timestamp),
                 "--add-metadata-string",
                 &format!("hammer.update-hash={}", update_hash),
                 "--tree",
@@ -378,6 +424,8 @@ fn verify_kernel(rootfs: &Path) -> Result<()> {
 fn show_etc_preview() -> Result<()> {
     Logger::info("Analyzing configuration changes (/etc)...");
 
+    // Config diff often runs against the system repo, so we assume ostree command finds it via default or sysroot.
+    // If needed, we can add --repo=/ostree/repo here too, but admin commands usually find it.
     let status = std::process::Command::new("ostree")
     .args(&["admin", "config-diff"])
     .status();
@@ -397,6 +445,11 @@ fn show_etc_preview() -> Result<()> {
 
 fn deploy_commit(ref_name: &str) -> Result<()> {
     Logger::info("Deploying new commit...");
+
+    // OSTree admin expects /ostree/deploy to exist.
+    if !Path::new("/ostree/deploy").exists() {
+        fs::create_dir_all("/ostree/deploy")?;
+    }
 
     if !Path::new("/ostree/deploy/debian").exists() {
         run_command("ostree", &["admin", "os-init", "debian"], "OS Init")?;
@@ -433,6 +486,10 @@ fn update_bootloader() -> Result<()> {
 
 fn handle_rollback() -> Result<()> {
     Logger::info("Rolling back to previous deployment...");
+
+    if !Path::new("/ostree/deploy").exists() {
+        return Err(anyhow!("Cannot rollback: Sysroot (/ostree/deploy) not initialized. No deployments found."));
+    }
 
     run_command("ostree", &["admin", "undeploy", "0"], "Rollback")?;
 
