@@ -6,13 +6,9 @@ edition = "2021"
 [dependencies]
 hammer-core = { path = "../core" }
 anyhow = { workspace = true }
+miette = { workspace = true }
 clap = { workspace = true }
 owo-colors = { workspace = true }
 indicatif = { workspace = true }
-tempfile = { workspace = true }
-ostree = { workspace = true }
-nix = { workspace = true }
-reqwest = { workspace = true }
-sha2 = { workspace = true }
-hex = { workspace = true }
 chrono = { workspace = true }
+dialoguer = { workspace = true }
