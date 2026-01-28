@@ -69,8 +69,11 @@ pub fn load_config() -> Result<HammerConfig> {
     } else if Path::new(APT_SOURCES).exists() {
         Logger::info(&format!("Loading sources from {}", APT_SOURCES));
         if let Ok(repo_config) = parse_apt_sources(APT_SOURCES) {
+            Logger::info(&format!("Detected repository: {} ({})", repo_config.url, repo_config.suite));
             config.repository = repo_config;
             return Ok(config);
+        } else {
+            Logger::error("Failed to parse /etc/apt/sources.list, falling back to default config.");
         }
     }
 
@@ -135,17 +138,49 @@ fn parse_apt_sources(path: &str) -> Result<RepositoryConfig> {
     let content = fs::read_to_string(path)?;
     for line in content.lines() {
         let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+
         if trimmed.starts_with("deb ") {
-            let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            if parts.len() >= 4 {
-                let url = parts[1].to_string();
-                let suite = parts[2].to_string();
-                let components = parts[3..].iter().map(|s| s.to_string()).collect();
-                return Ok(RepositoryConfig { url, suite, components });
+            let mut parts = trimmed.split_whitespace();
+            let _deb = parts.next(); // Skip "deb"
+
+            let mut next_part = parts.next();
+
+            // Skip options like [arch=amd64 signed-by=...]
+            while let Some(p) = next_part {
+                if p.starts_with('[') {
+                    // Consume until we find the closing bracket part
+                    if !p.ends_with(']') {
+                        while let Some(sub_p) = parts.next() {
+                            if sub_p.ends_with(']') { break; }
+                        }
+                    }
+                    next_part = parts.next();
+                } else {
+                    break;
+                }
+            }
+
+            // After skipping options, next_part should be the URL
+            if let Some(url) = next_part {
+                if let Some(suite) = parts.next() {
+                    let components: Vec<String> = parts.map(|s| s.to_string()).collect();
+
+                    // Simple check to ensure we parsed valid looking data
+                    if url.starts_with("http") && !suite.is_empty() {
+                        return Ok(RepositoryConfig {
+                            url: url.to_string(),
+                                  suite: suite.to_string(),
+                                  components
+                        });
+                    }
+                }
             }
         }
     }
-    Err(anyhow!("No valid deb line found"))
+    Err(anyhow!("No valid 'deb' line found in {}", path))
 }
 
 pub struct Logger;
