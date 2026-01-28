@@ -1,0 +1,11 @@
+[package]
+name = "hammer-builder"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+hammer-core = { path = "../core" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+owo-colors = { workspace = true }
+indicatif = { workspace = true }
