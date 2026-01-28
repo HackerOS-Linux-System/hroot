@@ -9,3 +9,4 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 owo-colors = { workspace = true }
 indicatif = { workspace = true }
+nix = { workspace = true }
