@@ -1,17 +1,16 @@
-use anyhow::{anyhow, Context, Result};
+use miette::{IntoDiagnostic, Result};
 use clap::{Parser, Subcommand};
 use hammer_core::{
-    calculate_dir_size, check_free_space, create_spinner, load_config, run_command, HammerConfig,
-    Logger,
+    btrfs_delete_atomic_snapshot, btrfs_list_atomic_snapshots, btrfs_snapshot_atomic,
+    create_spinner, create_progress_bar, run_command, Logger,
 };
-use nix::unistd::Uid;
 use owo_colors::OwoColorize;
-use sha2::{Digest, Sha256};
-use std::fs;
-use std::path::{Path, PathBuf};
+use dialoguer::{Select, Confirm};
+use std::process::{Command, Stdio};
+use indicatif::ProgressBar;
 
 #[derive(Parser)]
-#[command(name = "hammer-updater", about = "Atomic Updater for Hammer")]
+#[command(name = "hammer-updater")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -19,482 +18,210 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize the OSTree repository
-    Init,
-    /// Check for updates
-    Check,
-    /// Perform an atomic update
-    Update {
-        /// Force update even if metadata matches
-        #[arg(long)]
-        force: bool,
-            /// Show changes in /etc before applying
-            #[arg(long)]
-            preview_etc: bool,
-    },
-    /// Layer a local package onto the system (rebuilds image)
-    Layer {
-        /// Path to the .deb file
-        path: String,
-    },
-    /// Rollback to previous deployment
+    Update,
+    Layer { packages: Vec<String> },
+    Clean,
     Rollback,
 }
 
-const OSTREE_REPO: &str = "/ostree/repo";
-const BRANCH_NAME: &str = "debian/stable/amd64";
-const CACHE_DIR: &str = "/var/cache/hammer/apt";
-const LOCAL_PKG_DIR: &str = "/var/lib/hammer/local-pkgs";
-
 fn main() -> Result<()> {
-    if !Uid::current().is_root() {
-        eprintln!("{}", "Updater must run as root.".red().bold());
-        std::process::exit(1);
-    }
-
     let cli = Cli::parse();
-
     match cli.command {
-        Commands::Init => handle_init()?,
-        Commands::Check => handle_check()?,
-        Commands::Update { force, preview_etc } => handle_update(force, preview_etc, None)?,
-        Commands::Layer { path } => handle_layer(path)?,
+        Commands::Update => handle_update()?,
+        Commands::Layer { packages } => handle_layer(packages)?,
+        Commands::Clean => handle_clean()?,
         Commands::Rollback => handle_rollback()?,
     }
-
     Ok(())
 }
 
-fn handle_init() -> Result<()> {
-    Logger::info("Initializing OSTree repository...");
-
-    let repo_path = Path::new(OSTREE_REPO);
-    let config_path = repo_path.join("config");
-
-    // Check if it is a valid OSTree repo by looking for the config file.
-    // Just checking directory existence is not enough (it might be an empty dir).
-    if !config_path.exists() {
-        if !repo_path.exists() {
-            fs::create_dir_all(OSTREE_REPO)?;
-        }
-
-        // Use 'archive' mode instead of 'bare-user' for system deployments to preserve ownership correctly.
-        // 'bare-user' is for unprivileged setups and strips ownership info which breaks bootable systems.
-        // However, if the user specifically requested bare-user before, we switch to 'archive' (z2) which is safest for generic fs.
-        run_command(
-            "ostree",
-            &[&format!("--repo={}", OSTREE_REPO), "init", "--mode=archive"],
-                    "OSTree Init",
-        )?;
-        Logger::success("Initialized /ostree/repo");
-    } else {
-        Logger::info("OSTree repository already valid.");
-    }
-
-    // Initialize Cache Dirs
-    fs::create_dir_all(CACHE_DIR)?;
-    fs::create_dir_all(LOCAL_PKG_DIR)?;
-
-    // Ensure config exists
-    let _ = load_config()?;
-
-    Ok(())
+fn create_snapshot_name(suffix: &str) -> String {
+    let timestamp = chrono::Local::now().format("%Y-%m-%d-%H%M%S");
+    format!("{}-{}", timestamp, suffix)
 }
 
-fn compute_update_hash(config: &HammerConfig) -> Result<String> {
-    let spinner = create_spinner("Fetching remote repository metadata...");
-
-    // Try InRelease first (modern default), fallback to Release
-    let release_url = format!(
-        "{}/dists/{}/InRelease",
-        config.repository.url, config.repository.suite
-    );
-
-    // Log what we are checking to help debug
-    // We pause spinner briefly or just log before spinner
-    spinner.set_message(format!("Fetching metadata from {}...", release_url));
-
-    let resp_result = reqwest::blocking::get(&release_url)
-    .and_then(|r| r.error_for_status())
-    .map(|r| r.text());
-
-    let resp_text = match resp_result {
-        Ok(Ok(text)) => text,
-        _ => {
-            // Fallback to Release
-            let fallback_url = format!(
-                "{}/dists/{}/Release",
-                config.repository.url, config.repository.suite
-            );
-            spinner.set_message(format!("InRelease missing, trying {}...", fallback_url));
-            reqwest::blocking::get(&fallback_url)
-            .context("Failed to fetch Release file")?
-            .text()?
-        }
-    };
-
-    let mut hasher = Sha256::new();
-    hasher.update(resp_text.as_bytes());
-
-    hasher.update(config.packages.include.join(",").as_bytes());
-    hasher.update(config.packages.exclude.join(",").as_bytes());
-
-    // Include local packages in hash calculation
-    if Path::new(LOCAL_PKG_DIR).exists() {
-        for entry in fs::read_dir(LOCAL_PKG_DIR)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().map_or(false, |e| e == "deb") {
-                hasher.update(entry.file_name().as_encoded_bytes());
-            }
-        }
-    }
-
-    let hash = hex::encode(hasher.finalize());
-    spinner.finish_with_message("Metadata fetched.");
-
-    Ok(hash)
-}
-
-fn get_current_commit_hash() -> Result<Option<String>> {
-    let output = std::process::Command::new("ostree")
-    .args(&[
-        &format!("--repo={}", OSTREE_REPO),
-          "show",
-          "--print-metadata-key=hammer.update-hash",
-          BRANCH_NAME,
-    ])
-    .output();
-
-    match output {
-        Ok(out) => {
-            if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout)
-                .trim()
-                .replace("'", "");
-                if s.is_empty() || s == "null" {
-                    Ok(None)
-                } else {
-                    Ok(Some(s))
-                }
-            } else {
-                Ok(None)
-            }
-        }
-        Err(_) => Ok(None),
-    }
-}
-
-fn handle_check() -> Result<()> {
-    // Ensure repo structure is valid even for check
-    handle_init()?;
-
-    let config = load_config()?;
-
-    // Log explicit source usage for user verification
-    Logger::info(&format!("Checking updates for suite: {} ({})", config.repository.suite.cyan(), config.repository.url));
-
-    let remote_hash = compute_update_hash(&config)?;
-    let local_hash = get_current_commit_hash()?;
-
-    if let Some(local) = local_hash {
-        if local == remote_hash {
-            Logger::success("System is up-to-date (Hashes match).");
-            return Ok(());
-        }
-        println!(
-            "Update available:\nLocal:  {}\nRemote: {}",
-            local.yellow(),
-                 remote_hash.green()
-        );
-    } else {
-        println!("No local metadata found. Update recommended.");
-    }
-
-    Ok(())
-}
-
-fn handle_layer(path: String) -> Result<()> {
-    Logger::info(&format!("Layering local package: {}", path));
-
-    let src_path = Path::new(&path);
-    if !src_path.exists() {
-        return Err(anyhow!("Package file not found: {}", path));
-    }
-
-    // Ensure local pkg dir exists
-    fs::create_dir_all(LOCAL_PKG_DIR)?;
-
-    let file_name = src_path.file_name().ok_or(anyhow!("Invalid filename"))?;
-    let dest_path = Path::new(LOCAL_PKG_DIR).join(file_name);
-
-    fs::copy(src_path, &dest_path)?;
-    Logger::success(&format!("Package added to staging: {:?}", dest_path));
-
-    // Force update to rebuild image with new package
-    Logger::info("Triggering system rebuild to apply layer...");
-    handle_update(true, false, Some(dest_path))?;
-
-    Ok(())
-}
-
-fn handle_update(force: bool, preview_etc: bool, _new_pkg: Option<PathBuf>) -> Result<()> {
-    // Ensure OSTree repo is initialized before attempting update
-    handle_init()?;
-
-    let config = load_config()?;
-
-    Logger::info(&format!("Update source: {} ({})", config.repository.suite.cyan(), config.repository.url));
-
-    // 1. Idempotency Check
-    let update_hash = compute_update_hash(&config)?;
-    if !force {
-        let current_hash = get_current_commit_hash()?;
-        if let Some(current) = current_hash {
-            if current == update_hash {
-                Logger::success(
-                    "No changes detected in repository or config. System is up to date.",
-                );
-                return Ok(());
-            }
-        }
-    }
-
-    if preview_etc {
-        show_etc_preview()?;
-    }
-
-    // 2. Prepare Staging Area
-    let temp_dir = tempfile::tempdir()?;
-    let rootfs = temp_dir.path().join("rootfs");
-    fs::create_dir(&rootfs)?;
-
-    Logger::info(&format!(
-        "Starting atomic update. Staging in {:?}",
-        rootfs
-    ));
-
-    // Ensure cache directory exists
-    fs::create_dir_all(CACHE_DIR)?;
-
-    // 3. Build Rootfs with mmdebstrap
-    let spinner = create_spinner("Building new system image (mmdebstrap)...");
-
-    let include_str = config.packages.include.join(",");
-
-    // Binding values for argument lifetime
-    let include_flag = format!("--include={}", include_str);
-    let rootfs_str = rootfs.to_str().unwrap();
-
-    // Setup apt cache
-    // We mount the host CACHE_DIR into the container/chroot
-    // And we bind-mount it so the chroot can access the files
-    let apt_opt_cache = format!("Dir::Cache::Archives \"{}\";", CACHE_DIR);
-    let cache_hook = format!(
-        "mkdir -p \"$1\"{0} && mount --bind {0} \"$1\"{0}",
-        CACHE_DIR
-    );
-
-    let mut args = vec![
-        "--variant=minbase",
-        &include_flag,
-        "--format=directory",
-        "--aptopt", &apt_opt_cache,
-        "--setup-hook", &cache_hook,
-        &config.repository.suite,
-        rootfs_str,
-        &config.repository.url,
-    ];
-
-    // If local packages exist, we need to install them.
-    // We use a setup-hook to copy them in and dpkg -i them.
-    // NOTE: replaced 'copy-in' (non-standard) with 'cp -r'
-    let hook_cmd = format!(
-        "mkdir -p \"$1\"/tmp/local-pkgs && cp -r {}/* \"$1\"/tmp/local-pkgs/ && chroot \"$1\" dpkg -iR /tmp/local-pkgs && chroot \"$1\" rm -rf /tmp/local-pkgs",
-        LOCAL_PKG_DIR
-    );
-
-    let setup_hook_arg = format!("--setup-hook={}", hook_cmd);
-
-    // Only add hook if directory is not empty
-    let has_local = Path::new(LOCAL_PKG_DIR).exists() && fs::read_dir(LOCAL_PKG_DIR)?.next().is_some();
-    if has_local {
-        // Insert before positional arguments (suite, rootfs, url)
-        // args.len() is currently N. The last 3 are positional.
-        let pos = args.len() - 3;
-        args.insert(pos, &setup_hook_arg);
-    }
-
-    run_command("mmdebstrap", &args, "Building RootFS")?;
-
-    // Cleanup excluded packages
-    if config.packages.exclude.contains(&"apt".to_string()) {
-        run_command(
-            "rm",
-            &["-rf", rootfs.join("var/lib/apt").to_str().unwrap()],
-                    "Cleaning APT",
-        )?;
-        run_command(
-            "rm",
-            &["-f", rootfs.join("usr/bin/apt").to_str().unwrap()],
-                    "Removing APT binary",
-        )?;
-    }
-
-    spinner.finish_with_message("RootFS built.");
-
-    // --- PRE-FLIGHT CHECKS ---
-    Logger::info("Running Pre-flight Checks...");
-
-    // A. Kernel Check
-    verify_kernel(&rootfs)?;
-
-    // B. Disk Space Check
-    let rootfs_size = calculate_dir_size(&rootfs)?;
-    let required_space = rootfs_size * 2;
-    check_free_space(OSTREE_REPO, required_space)?;
-    Logger::success(&format!(
-        "Disk space check passed (Image size: {:.2} MB)",
-                             rootfs_size as f64 / 1024.0 / 1024.0
-    ));
-
-    // 4. Commit to OSTree
-    let spinner_ostree = create_spinner("Committing to OSTree...");
-
-    let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-
-    run_command(
-        "ostree",
-        &[
-            &format!("--repo={}", OSTREE_REPO),
-                "commit",
-                "--branch",
-                BRANCH_NAME,
-                "--subject",
-                &format!("Update {}", timestamp),
-                "--add-metadata-string",
-                &format!("hammer.update-hash={}", update_hash),
-                "--tree",
-                &format!("dir={}", rootfs.to_str().unwrap()),
-        ],
-        "OSTree Commit",
-    )?;
-
-    spinner_ostree.finish_with_message("Changes committed.");
-
-    // 5. Deploy & Bootloader
-    deploy_commit(BRANCH_NAME)?;
-    update_bootloader()?;
-
-    Logger::success("Update complete. Reboot to apply changes.");
-    Ok(())
-}
-
-fn verify_kernel(rootfs: &Path) -> Result<()> {
-    let boot_dir = rootfs.join("boot");
-    if !boot_dir.exists() {
-        return Err(anyhow!("Pre-flight Failed: /boot directory missing in rootfs!"));
-    }
-
-    let mut found_kernel = false;
-    let mut found_initrd = false;
-
-    for entry in fs::read_dir(boot_dir)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with("vmlinuz") {
-            found_kernel = true;
-        }
-        if name.starts_with("initrd.img") {
-            found_initrd = true;
-        }
-    }
-
-    if !found_kernel {
-        return Err(anyhow!("Pre-flight Failed: No vmlinuz found in rootfs."));
-    }
-    if !found_initrd {
-        return Err(anyhow!("Pre-flight Failed: No initrd.img found in rootfs."));
-    }
-
-    Logger::success("Pre-flight: Kernel and Initrd verified.");
-    Ok(())
-}
-
-fn show_etc_preview() -> Result<()> {
-    Logger::info("Analyzing configuration changes (/etc)...");
-
-    // Config diff often runs against the system repo, so we assume ostree command finds it via default or sysroot.
-    // If needed, we can add --repo=/ostree/repo here too, but admin commands usually find it.
-    let status = std::process::Command::new("ostree")
-    .args(&["admin", "config-diff"])
-    .status();
-
-    if let Ok(s) = status {
-        if s.success() {
-            println!("{}", "No changes detected in /etc.".green());
-        } else {
-            Logger::info("Configuration differences found above.");
-        }
-    } else {
-        Logger::error("Failed to run config-diff");
-    }
-
-    Ok(())
-}
-
-fn deploy_commit(ref_name: &str) -> Result<()> {
-    Logger::info("Deploying new commit...");
-
-    // OSTree admin expects /ostree/deploy to exist.
-    if !Path::new("/ostree/deploy").exists() {
-        fs::create_dir_all("/ostree/deploy")?;
-    }
-
-    if !Path::new("/ostree/deploy/debian").exists() {
-        run_command("ostree", &["admin", "os-init", "debian"], "OS Init")?;
-    }
-
-    run_command(
-        "ostree",
-        &["admin", "deploy", "debian", ref_name],
-        "OSTree Deploy",
-    )?;
-
-    Ok(())
-}
-
-fn update_bootloader() -> Result<()> {
-    Logger::info("Updating Bootloader Configuration...");
-
-    if !Path::new("/boot/grub").exists() {
+fn handle_update() -> Result<()> {
+    Logger::section("ATOMIC SYSTEM UPDATE");
+
+    // Initialize global progress bar for steps
+    let steps = 4;
+    let main_pb = create_progress_bar(steps, "Initializing...");
+
+    // Step 1: Prep
+    main_pb.set_message("Step 1/4: Preparing Filesystem...");
+    main_pb.set_position(1);
+
+    // Ensure RW
+    Logger::info("Remounting Root as RW...");
+    run_command("mount", &["-o", "remount,rw", "/"], "Remount RW")?;
+
+    // Step 2: Snapshot
+    main_pb.set_message("Step 2/4: Creating Snapshot...");
+    main_pb.set_position(2);
+
+    let snap_name = create_snapshot_name("pre-update");
+    let spinner = create_spinner("Snapshotting @ subvolume...");
+    btrfs_snapshot_atomic(&snap_name)?;
+    spinner.finish_with_message("Snapshot created in @snapshots");
+
+    // Step 3: APT Update
+    main_pb.set_message("Step 3/4: Downloading Updates...");
+    main_pb.set_position(3);
+
+    Logger::info("Running apt update & upgrade (Logs below)...");
+
+    // We pause the main PB briefly or let logs flow under it?
+    // indicatif output handles this if configured, but mixing streams is hard.
+    // We will just let logs print.
+
+    let status = Command::new("apt")
+    .args(&["update"])
+    .stdout(Stdio::inherit())
+    .stderr(Stdio::inherit())
+    .status()
+    .into_diagnostic()?;
+
+    if !status.success() {
+        Logger::error("apt update failed.");
         return Ok(());
     }
 
-    let status = run_command("update-grub", &[], "Updating GRUB");
+    let status = Command::new("apt")
+    .args(&["full-upgrade", "-y"])
+    .stdout(Stdio::inherit())
+    .stderr(Stdio::inherit())
+    .status()
+    .into_diagnostic()?;
 
-    if status.is_err() {
-        run_command(
-            "grub-mkconfig",
-            &["-o", "/boot/grub/grub.cfg"],
-            "Generating GRUB Config",
-        )?;
+    if status.success() {
+        // Step 4: Finalize
+        main_pb.set_message("Step 4/4: Finalizing...");
+        main_pb.set_position(4);
+
+        run_command("sync", &[], "Sync Filesystem")?;
+
+        main_pb.finish_with_message("Update Complete!");
+        Logger::success("System successfully updated.");
+    } else {
+        main_pb.abandon_with_message("Update Failed");
+        Logger::error("APT Upgrade failed.");
+
+        if Confirm::new().with_prompt("Rollback now?").interact().into_diagnostic()? {
+            // Rollback logic here (complex on live system)
+            Logger::warn("Please run 'hammer rollback' or select snapshot at boot.");
+        }
     }
 
+    Logger::end_section();
+    Ok(())
+}
+
+fn handle_layer(packages: Vec<String>) -> Result<()> {
+    if packages.is_empty() { return Ok(()); }
+
+    Logger::section("PACKAGE LAYERING");
+    run_command("mount", &["-o", "remount,rw", "/"], "Remount RW")?;
+
+    let snap_name = create_snapshot_name("pre-layer");
+    let spinner = create_spinner("Safety Snapshot...");
+    btrfs_snapshot_atomic(&snap_name)?;
+    spinner.finish_with_message("Snapshot created.");
+
+    let mut args = vec!["install", "-y"];
+    let pkgs_refs: Vec<&str> = packages.iter().map(|s| s.as_str()).collect();
+    args.extend(pkgs_refs);
+
+    let status = Command::new("apt")
+    .args(&args)
+    .stdin(Stdio::inherit())
+    .stdout(Stdio::inherit())
+    .stderr(Stdio::inherit())
+    .status()
+    .into_diagnostic()?;
+
+    if status.success() {
+        run_command("sync", &[], "Sync")?;
+        Logger::success("Layer applied.");
+    } else {
+        Logger::error("Failed.");
+    }
+    Logger::end_section();
+    Ok(())
+}
+
+fn handle_clean() -> Result<()> {
+    Logger::section("CLEANING SNAPSHOTS");
+    let snapshots = btrfs_list_atomic_snapshots()?;
+
+    if snapshots.len() <= 3 {
+        Logger::info("Nothing to clean.");
+    } else {
+        let to_delete = &snapshots[0..(snapshots.len() - 3)];
+        for snap in to_delete {
+            Logger::info(&format!("Deleting {}", snap));
+            btrfs_delete_atomic_snapshot(snap)?;
+        }
+        Logger::success("Cleanup done.");
+    }
+    Logger::end_section();
     Ok(())
 }
 
 fn handle_rollback() -> Result<()> {
-    Logger::info("Rolling back to previous deployment...");
+    Logger::section("SYSTEM ROLLBACK");
+    let snapshots = btrfs_list_atomic_snapshots()?;
 
-    if !Path::new("/ostree/deploy").exists() {
-        return Err(anyhow!("Cannot rollback: Sysroot (/ostree/deploy) not initialized. No deployments found."));
+    if snapshots.is_empty() {
+        Logger::error("No snapshots found in @snapshots.");
+        return Ok(());
     }
 
-    run_command("ostree", &["admin", "undeploy", "0"], "Rollback")?;
+    let selection = Select::new()
+    .with_prompt("Select snapshot to restore")
+    .items(&snapshots)
+    .default(snapshots.len() - 1)
+    .interact()
+    .into_diagnostic()?;
 
-    update_bootloader()?;
+    let target = &snapshots[selection];
 
-    Logger::success("Rolled back. Reboot to enter previous state.");
+    Logger::warn(&format!("Target: {}", target.yellow()));
+    Logger::warn("To restore: The system will rename current '@' to '@bad-date' and restore snapshot to '@'.");
+    Logger::warn("REBOOT IS REQUIRED IMMEDIATELY AFTER.");
+
+    if Confirm::new().with_prompt("Proceed?").interact().into_diagnostic()? {
+        use hammer_core::{mount_btrfs_root, umount_btrfs_root, MOUNT_POINT};
+        use std::path::Path;
+
+        let spinner = create_spinner("Performing rollback...");
+        mount_btrfs_root()?;
+
+        // 1. Rename current @
+        let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let bad_name = format!("@bad-{}", timestamp);
+        let root = Path::new(MOUNT_POINT);
+
+        run_command("mv", &[
+            &root.join("@").to_string_lossy(),
+                    &root.join(&bad_name).to_string_lossy()
+        ], "Rename current @")?;
+
+        // 2. Snapshot target to @
+        let snap_src = root.join("@snapshots").join(target);
+        let new_root = root.join("@");
+
+        run_command("btrfs", &[
+            "subvolume", "snapshot",
+            &snap_src.to_string_lossy(),
+                    &new_root.to_string_lossy()
+        ], "Restore Snapshot to @")?;
+
+        umount_btrfs_root()?;
+        spinner.finish_with_message("Rollback applied.");
+
+        Logger::success("Rollback successful. Please REBOOT now.");
+    }
+
+    Logger::end_section();
     Ok(())
 }
