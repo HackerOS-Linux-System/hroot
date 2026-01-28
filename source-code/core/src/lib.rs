@@ -1,186 +1,33 @@
-use anyhow::{Context, Result, anyhow};
+use miette::{Diagnostic, IntoDiagnostic, Result, WrapErr};
 use indicatif::{ProgressBar, ProgressStyle};
 use owo_colors::OwoColorize;
-use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
-use walkdir::WalkDir;
-use nix::sys::statvfs::statvfs;
+use thiserror::Error;
 
-pub const LOG_DIR: &str = "/usr/lib/HackerOS/hammer/logs";
-pub const CONFIG_PATH: &str = "/etc/hammer/config.toml";
-pub const SOURCE_LIST_HK: &str = "/etc/hammer/source-list.hk";
-pub const APT_SOURCES: &str = "/etc/apt/sources.list";
+pub const LOG_DIR: &str = "/var/log/hammer";
+pub const MOUNT_POINT: &str = "/run/hammer/btrfs-root";
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct HammerConfig {
-    pub repository: RepositoryConfig,
-    pub packages: PackagesConfig,
-}
+#[derive(Error, Debug, Diagnostic)]
+pub enum HammerError {
+    #[error("Command failed: {0}")]
+    #[diagnostic(code(hammer::command_failed), help("Check the output log for details."))]
+    CommandFailed(String),
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct RepositoryConfig {
-    pub url: String,
-    pub suite: String,
-    pub components: Vec<String>,
-}
+    #[error("IO Error: {0}")]
+    #[diagnostic(code(hammer::io_error))]
+    IoError(String),
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct PackagesConfig {
-    pub include: Vec<String>,
-    pub exclude: Vec<String>,
-}
+    #[error("Configuration Error: {0}")]
+    #[diagnostic(code(hammer::config_error))]
+    ConfigError(String),
 
-impl Default for HammerConfig {
-    fn default() -> Self {
-        Self {
-            repository: RepositoryConfig {
-                url: "http://deb.debian.org/debian".to_string(),
-                suite: "bookworm".to_string(),
-                components: vec!["main".to_string()],
-            },
-            packages: PackagesConfig {
-                include: vec!["linux-image-amd64".to_string(), "systemd".to_string(), "coreutils".to_string()],
-                exclude: vec!["apt".to_string(), "dpkg".to_string()],
-            },
-        }
-    }
-}
-
-pub fn load_config() -> Result<HammerConfig> {
-    // 1. Load Base Config (Package lists etc)
-    let mut config = if Path::new(CONFIG_PATH).exists() {
-        let content = fs::read_to_string(CONFIG_PATH).context("Failed to read config file")?;
-        toml::from_str(&content).context("Failed to parse config file")?
-    } else {
-        HammerConfig::default()
-    };
-
-    // 2. Override Repository Sources (Priority: .hk -> apt sources -> toml default)
-    if Path::new(SOURCE_LIST_HK).exists() {
-        Logger::info(&format!("Loading sources from {}", SOURCE_LIST_HK));
-        if let Ok(repo_config) = parse_hk_file(SOURCE_LIST_HK) {
-            config.repository = repo_config;
-            return Ok(config);
-        }
-    } else if Path::new(APT_SOURCES).exists() {
-        Logger::info(&format!("Loading sources from {}", APT_SOURCES));
-        if let Ok(repo_config) = parse_apt_sources(APT_SOURCES) {
-            Logger::info(&format!("Detected repository: {} ({})", repo_config.url, repo_config.suite));
-            config.repository = repo_config;
-            return Ok(config);
-        } else {
-            Logger::error("Failed to parse /etc/apt/sources.list, falling back to default config.");
-        }
-    }
-
-    Ok(config)
-}
-
-/// Parses the custom HackerOS .hk format
-/// Format:
-/// [section]
-/// -> key => value
-fn parse_hk_file(path: &str) -> Result<RepositoryConfig> {
-    let file = fs::File::open(path)?;
-    let reader = BufReader::new(file);
-
-    let mut url = String::new();
-    let mut suite = String::new();
-    let mut components = Vec::new();
-
-    // Regex for: -> key => value
-    let re = regex::Regex::new(r"^\s*->\s*(.*?)\s*=>\s*(.*)$")?;
-
-    for line in reader.lines() {
-        let line = line?;
-        let trimmed = line.trim();
-
-        if trimmed.starts_with('!') || trimmed.is_empty() {
-            continue;
-        }
-
-        if let Some(caps) = re.captures(trimmed) {
-            let key = caps.get(1).map_or("", |m| m.as_str()).trim();
-            let value = caps.get(2).map_or("", |m| m.as_str()).trim();
-
-            match key {
-                "url" | "mirror" => url = value.to_string(),
-                "suite" | "dist" => suite = value.to_string(),
-                "components" => {
-                    components = value.split([',', ' '])
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-                    .collect();
-                }
-                _ => {}
-            }
-        }
-    }
-
-    if url.is_empty() {
-        return Err(anyhow!("No 'url' found in .hk file"));
-    }
-    if suite.is_empty() {
-        suite = "stable".to_string(); // Fallback
-    }
-    if components.is_empty() {
-        components = vec!["main".to_string()];
-    }
-
-    Ok(RepositoryConfig { url, suite, components })
-}
-
-fn parse_apt_sources(path: &str) -> Result<RepositoryConfig> {
-    let content = fs::read_to_string(path)?;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('#') || trimmed.is_empty() {
-            continue;
-        }
-
-        if trimmed.starts_with("deb ") {
-            let mut parts = trimmed.split_whitespace();
-            let _deb = parts.next(); // Skip "deb"
-
-            let mut next_part = parts.next();
-
-            // Skip options like [arch=amd64 signed-by=...]
-            while let Some(p) = next_part {
-                if p.starts_with('[') {
-                    // Consume until we find the closing bracket part
-                    if !p.ends_with(']') {
-                        while let Some(sub_p) = parts.next() {
-                            if sub_p.ends_with(']') { break; }
-                        }
-                    }
-                    next_part = parts.next();
-                } else {
-                    break;
-                }
-            }
-
-            // After skipping options, next_part should be the URL
-            if let Some(url) = next_part {
-                if let Some(suite) = parts.next() {
-                    let components: Vec<String> = parts.map(|s| s.to_string()).collect();
-
-                    // Simple check to ensure we parsed valid looking data
-                    if url.starts_with("http") && !suite.is_empty() {
-                        return Ok(RepositoryConfig {
-                            url: url.to_string(),
-                                  suite: suite.to_string(),
-                                  components
-                        });
-                    }
-                }
-            }
-        }
-    }
-    Err(anyhow!("No valid 'deb' line found in {}", path))
+    #[error("Btrfs Error: {0}")]
+    #[diagnostic(code(hammer::btrfs_error), help("Ensure / is a Btrfs subvolume and layout uses @."))]
+    BtrfsError(String),
 }
 
 pub struct Logger;
@@ -188,7 +35,7 @@ pub struct Logger;
 impl Logger {
     pub fn init() -> Result<()> {
         if !Path::new(LOG_DIR).exists() {
-            fs::create_dir_all(LOG_DIR).context("Failed to create log directory")?;
+            fs::create_dir_all(LOG_DIR).into_diagnostic()?;
         }
         Ok(())
     }
@@ -204,29 +51,52 @@ impl Logger {
     }
 
     pub fn info(message: &str) {
-        println!("{} {}", "INFO".blue().bold(), message);
+        println!(" {} {}", "│".blue(), message);
         Self::log(&format!("INFO: {}", message));
     }
 
+    pub fn section(title: &str) {
+        println!("\n{} {}", "┌──".magenta(), title.magenta().bold());
+    }
+
+    pub fn end_section() {
+        println!("{}", "└──".magenta());
+    }
+
     pub fn error(message: &str) {
-        eprintln!("{} {}", "ERROR".red().bold(), message);
+        eprintln!(" {} {}", "✖".red(), message.red());
         Self::log(&format!("ERROR: {}", message));
     }
 
     pub fn success(message: &str) {
-        println!("{} {}", "SUCCESS".green().bold(), message);
+        println!(" {} {}", "✓".green(), message.green());
         Self::log(&format!("SUCCESS: {}", message));
     }
+
+    pub fn warn(message: &str) {
+        println!(" {} {}", "!".yellow(), message.yellow());
+        Self::log(&format!("WARN: {}", message));
+    }
+}
+
+pub fn create_progress_bar(len: u64, msg: &str) -> ProgressBar {
+    let pb = ProgressBar::new(len);
+    pb.set_style(
+        ProgressStyle::default_bar()
+        .template("{spinner:.cyan} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+        .unwrap()
+        .progress_chars("=>-"),
+    );
+    pb.set_message(msg.to_string());
+    pb
 }
 
 pub fn create_spinner(msg: &str) -> ProgressBar {
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::default_spinner()
-        .tick_strings(&[
-            "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"
-        ])
-        .template("{spinner:.blue} {msg}")
+        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
+        .template("{spinner:.cyan} {msg}")
         .unwrap(),
     );
     pb.set_message(msg.to_string());
@@ -234,7 +104,7 @@ pub fn create_spinner(msg: &str) -> ProgressBar {
     pb
 }
 
-pub fn run_command(cmd: &str, args: &[&str], description: &str) -> Result<()> {
+pub fn run_command(cmd: &str, args: &[&str], description: &str) -> Result<String> {
     Logger::log(&format!("Running: {} {}", cmd, args.join(" ")));
 
     let output = Command::new(cmd)
@@ -242,42 +112,111 @@ pub fn run_command(cmd: &str, args: &[&str], description: &str) -> Result<()> {
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
     .output()
-    .context(format!("Failed to execute {}", description))?;
+    .into_diagnostic()
+    .wrap_err(format!("Failed to execute binary: {}", cmd))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Logger::error(&format!("Command failed: {}\n{}", description, stderr));
-        return Err(anyhow::anyhow!("{} failed: {}", description, stderr));
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        Logger::log(&format!("Command failed stderr: {}", stderr));
+        return Err(HammerError::CommandFailed(format!("{} failed: {}", description, stderr)).into());
     }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+// --- Btrfs Helpers ---
+
+/// Mounts the top-level Btrfs root (ID 5) to a temporary location
+pub fn mount_btrfs_root() -> Result<String> {
+    if !Path::new(MOUNT_POINT).exists() {
+        fs::create_dir_all(MOUNT_POINT).into_diagnostic()?;
+    }
+
+    // Identify the device / is mounted on
+    let output = run_command("findmnt", &["-n", "-o", "SOURCE", "/"], "Find Root Device")?;
+
+    // Fix: findmnt often returns "/dev/sda2[/@]" or similar.
+    // We need just "/dev/sda2" for the mount command.
+    let device_raw = output.trim();
+    let device = device_raw.split('[').next().unwrap_or(device_raw);
+
+    Logger::info(&format!("Detected root device: {}", device));
+
+    // Mount subvolid=5
+    let status = Command::new("mount")
+    .args(&["-t", "btrfs", "-o", "subvolid=5", device, MOUNT_POINT])
+    .output()
+    .into_diagnostic()?;
+
+    if !status.status.success() {
+        // Check if already mounted
+        let check = run_command("mount", &[], "Check mounts")?;
+        if check.contains(MOUNT_POINT) {
+            return Ok(MOUNT_POINT.to_string());
+        }
+        return Err(HammerError::BtrfsError("Failed to mount Btrfs top-level root".into()).into());
+    }
+
+    Ok(MOUNT_POINT.to_string())
+}
+
+pub fn umount_btrfs_root() -> Result<()> {
+    // Attempt unmount, but don't fail hard if it fails (it might be lazy unmounted later by OS)
+    let _ = run_command("umount", &[MOUNT_POINT], "Unmount Btrfs Root");
     Ok(())
 }
 
-// --- Pre-flight Utils ---
+pub fn btrfs_snapshot_atomic(name: &str) -> Result<()> {
+    // Requires @ layout
+    mount_btrfs_root()?;
 
-pub fn calculate_dir_size(path: &Path) -> Result<u64> {
-    let mut total_size = 0;
-    for entry in WalkDir::new(path) {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        if metadata.is_file() {
-            total_size += metadata.len();
-        }
+    let root_subvol = Path::new(MOUNT_POINT).join("@");
+    let snap_dir = Path::new(MOUNT_POINT).join("@snapshots");
+    let snap_target = snap_dir.join(name);
+
+    if !root_subvol.exists() {
+        umount_btrfs_root()?;
+        return Err(HammerError::BtrfsError("Subvolume @ not found. Hammer requires @ layout.".into()).into());
     }
-    Ok(total_size)
+
+    if !snap_dir.exists() {
+        fs::create_dir_all(&snap_dir).into_diagnostic()?;
+    }
+
+    let src = root_subvol.to_string_lossy();
+    let dest = snap_target.to_string_lossy();
+
+    run_command("btrfs", &["subvolume", "snapshot", &src, &dest], "Create Snapshot")?;
+
+    umount_btrfs_root()?;
+    Ok(())
 }
 
-pub fn check_free_space(path: &str, required_bytes: u64) -> Result<()> {
-    let stat = statvfs(path)?;
-    // Use rust-style getters provided by nix crate
-    let available_bytes = stat.blocks_available() as u64 * stat.fragment_size() as u64;
+pub fn btrfs_list_atomic_snapshots() -> Result<Vec<String>> {
+    mount_btrfs_root()?;
+    let snap_dir = Path::new(MOUNT_POINT).join("@snapshots");
 
-    if available_bytes < required_bytes {
-        return Err(anyhow!(
-            "Insufficient disk space on {}. Required: {:.2} MB, Available: {:.2} MB",
-            path,
-            required_bytes as f64 / 1024.0 / 1024.0,
-            available_bytes as f64 / 1024.0 / 1024.0
-        ));
+    let mut snaps = Vec::new();
+    if snap_dir.exists() {
+        for entry in fs::read_dir(snap_dir).into_diagnostic()? {
+            let entry = entry.into_diagnostic()?;
+            snaps.push(entry.file_name().to_string_lossy().to_string());
+        }
     }
+
+    umount_btrfs_root()?;
+    snaps.sort();
+    Ok(snaps)
+}
+
+pub fn btrfs_delete_atomic_snapshot(name: &str) -> Result<()> {
+    mount_btrfs_root()?;
+    let snap_path = Path::new(MOUNT_POINT).join("@snapshots").join(name);
+
+    if snap_path.exists() {
+        run_command("btrfs", &["subvolume", "delete", &snap_path.to_string_lossy()], "Delete Snapshot")?;
+    }
+
+    umount_btrfs_root()?;
     Ok(())
 }
