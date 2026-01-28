@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 hammer-core = { path = "../core" }
-anyhow = { workspace = true }
+miette = { workspace = true }
 clap = { workspace = true }
 nix = { workspace = true }
 owo-colors = { workspace = true }
